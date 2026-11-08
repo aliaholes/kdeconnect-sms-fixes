@@ -1,0 +1,1199 @@
+From 46b4cc918a5b577f7d188f89de3421e9aae64689 Mon Sep 17 00:00:00 2001
+From: Alia Holes <thealiaholes@gmail.com>
+Date: Sat, 7 Nov 2026 21:12:43 -0800
+Subject: [PATCH 6/6] tests: drive the SMS plugin against a fake device
+
+Load the real kdeconnect_sms plugin with a TestDevice that records every
+packet sent, and check that it asks for conversations when the link comes up
+and again after a reconnect, sends a light request_conversation on the
+heartbeat, reports the sync times on its D-Bus adaptor, reports an unreadable
+attachment instead of sending, and shrinks a 4 MB photo under the image
+budget before it goes out; that a send from a worker thread still goes out;
+and that a silent phone raises the stall notification once per episode,
+holds the warning state through many heartbeats, and clears it on a reply;
+that a link flapping faster than the window still raises it; that a device
+whose every send fails raises it; and that a disconnect really closes it
+(seen through a stand-in org.freedesktop.Notifications on the test's session
+bus) and a reconnect decides afresh.
+
+smssyncstatustest drives SmsSyncKeeper with a fake clock through many
+unanswered heartbeats and checks what the SMS app would show at every
+15-second step: never blank, the warning continuous once the window has
+passed, and the first unanswered request never moved; also reconnects every
+60 s with no replies (warns, clock never reset), a phone away for an hour
+(gets its window back), a debounced link-up (never "answered" from an older
+reply, its request deferred, not dropped) and every send failing.
+smspastetest checks the asynchronous, per-user paste of a bitmap, the text
+fallbacks, and that a failed save is reported with its reason.
+---
+ tests/CMakeLists.txt        |  12 +
+ tests/smspastetest.cpp      | 184 ++++++++++++
+ tests/smspluginsynctest.cpp | 571 ++++++++++++++++++++++++++++++++++++
+ tests/smssyncstatustest.cpp | 366 +++++++++++++++++++++++
+ 4 files changed, 1133 insertions(+)
+ create mode 100644 tests/smspastetest.cpp
+ create mode 100644 tests/smspluginsynctest.cpp
+ create mode 100644 tests/smssyncstatustest.cpp
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index d4e599e..ab2bdff 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -29,6 +29,18 @@ ecm_add_test(mmsattachmentstest.cpp ${PROJECT_SOURCE_DIR}/plugins/sms/mmsattachm
+ ecm_add_test(smssynckeepertest.cpp ${PROJECT_SOURCE_DIR}/plugins/sms/smssynckeeper.cpp
+     TEST_NAME smssynckeepertest
+     LINK_LIBRARIES ${kdeconnect_libraries})
++ecm_add_test(smssyncstatustest.cpp ${PROJECT_SOURCE_DIR}/plugins/sms/smssynckeeper.cpp
++    TEST_NAME smssyncstatustest
++    LINK_LIBRARIES ${kdeconnect_libraries})
++ecm_add_test(smspastetest.cpp
++    TEST_NAME smspastetest
++    LINK_LIBRARIES ${kdeconnect_libraries} Qt::Gui)
++ecm_add_test(smspluginsynctest.cpp testdevice.cpp
++    TEST_NAME smspluginsynctest
++    LINK_LIBRARIES ${kdeconnect_libraries} Qt::Gui KF6::CoreAddons)
++target_compile_definitions(smspluginsynctest PRIVATE KDECONNECT_SMS_PLUGIN_PATH="$<TARGET_FILE:kdeconnect_sms>"
++    KDECONNECT_NOTIFYRC_PATH="${PROJECT_SOURCE_DIR}/plugins/kdeconnect.notifyrc")
++add_dependencies(smspluginsynctest kdeconnect_sms)
+ ecm_add_test(lanratelimittest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ ecm_add_test(lanipv6test.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ if (WIN32 OR APPLE)
+diff --git a/tests/smspastetest.cpp b/tests/smspastetest.cpp
+new file mode 100644
+index 0000000..5a62e4c
+--- /dev/null
++++ b/tests/smspastetest.cpp
+@@ -0,0 +1,184 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "smsapp/smshelper.h"
++
++#include <QClipboard>
++#include <QFuture>
++#include <QFileInfo>
++#include <QGuiApplication>
++#include <QImage>
++#include <QMimeData>
++#include <QSignalSpy>
++#include <QStandardPaths>
++#include <QTemporaryDir>
++#include <QTest>
++#include <QThread>
++#include <QtConcurrentRun>
++
++/**
++ * Pasting into the SMS compose field (Ctrl+V and the right-click menu both call
++ * SendingArea's paste(), which asks SmsHelper): a bitmap is written to a PNG off
++ * the GUI thread, under the per-user runtime directory, and delivered later;
++ * text and anything else return 0 so a normal text paste happens.
++ */
++class SmsPasteTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void initTestCase();
++    void testBitmapIsSavedAsync();
++    void testTextIsNotAnAttachment();
++    void testBitmapWithTextPastesText();
++    void testImageFilesAreAttachedDirectly();
++    void testPasteDirIsPerUser();
++    void testSaveRunsOnAWorker();
++    void testSaveFailureIsReported();
++
++private:
++    QTemporaryDir m_runtime;
++    QTemporaryDir m_files;
++};
++
++void SmsPasteTest::initTestCase()
++{
++    QVERIFY(m_runtime.isValid());
++    QVERIFY(m_files.isValid());
++    QFile::setPermissions(m_runtime.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
++    qputenv("XDG_RUNTIME_DIR", m_runtime.path().toLocal8Bit());
++}
++
++void SmsPasteTest::testBitmapIsSavedAsync()
++{
++    SmsHelper helper;
++    QImage shot(1920, 1080, QImage::Format_RGB32);
++    shot.fill(Qt::darkCyan);
++    QGuiApplication::clipboard()->setImage(shot);
++    QVERIFY(helper.clipboardPasteable());
++
++    QSignalSpy ready(&helper, &SmsHelper::clipboardAttachmentsReady);
++    const int id = helper.pasteClipboardAttachments();
++    QVERIFY(id > 0);
++    QCOMPARE(ready.count(), 0); // not on this call: written in the background
++    QVERIFY(ready.wait(10000));
++    QCOMPARE(ready.first().at(0).toInt(), id);
++    const QList<QUrl> urls = ready.first().at(1).value<QList<QUrl>>();
++    QCOMPARE(urls.size(), 1);
++    const QString path = urls.first().toLocalFile();
++    QVERIFY2(path.startsWith(m_runtime.path() + QStringLiteral("/kdeconnect-sms-paste/")), qPrintable(path));
++    QImage back(path);
++    QCOMPARE(back.size(), shot.size());
++    QCOMPARE(QFileInfo(path).permissions() & (QFileDevice::ReadOther | QFileDevice::ReadGroup), QFileDevice::Permissions());
++}
++
++void SmsPasteTest::testTextIsNotAnAttachment()
++{
++    SmsHelper helper;
++    QGuiApplication::clipboard()->setText(QStringLiteral("hello there"));
++    QVERIFY(helper.clipboardPasteable());
++    QCOMPARE(helper.pasteClipboardAttachments(), 0);
++    QCOMPARE(helper.clipboardText(), QStringLiteral("hello there"));
++}
++
++void SmsPasteTest::testBitmapWithTextPastesText()
++{
++    SmsHelper helper;
++    auto *mime = new QMimeData;
++    QImage img(64, 64, QImage::Format_RGB32);
++    img.fill(Qt::red);
++    mime->setImageData(img);
++    mime->setText(QStringLiteral("a cell from a spreadsheet"));
++    QGuiApplication::clipboard()->setMimeData(mime);
++    QCOMPARE(helper.pasteClipboardAttachments(), 0);
++}
++
++void SmsPasteTest::testImageFilesAreAttachedDirectly()
++{
++    SmsHelper helper;
++    const QString a = m_files.filePath(QStringLiteral("a.png"));
++    const QString b = m_files.filePath(QStringLiteral("b.jpg"));
++    QImage img(32, 32, QImage::Format_RGB32);
++    img.fill(Qt::blue);
++    QVERIFY(img.save(a));
++    QVERIFY(img.save(b));
++    auto *mime = new QMimeData;
++    mime->setUrls({QUrl::fromLocalFile(a), QUrl::fromLocalFile(b)});
++    QGuiApplication::clipboard()->setMimeData(mime);
++
++    QSignalSpy ready(&helper, &SmsHelper::clipboardAttachmentsReady);
++    const int id = helper.pasteClipboardAttachments();
++    QVERIFY(id > 0);
++    QVERIFY(ready.wait(5000));
++    QCOMPARE(ready.first().at(0).toInt(), id);
++    QCOMPARE(ready.first().at(1).value<QList<QUrl>>(), (QList<QUrl>{QUrl::fromLocalFile(a), QUrl::fromLocalFile(b)}));
++}
++
++void SmsPasteTest::testPasteDirIsPerUser()
++{
++    QVERIFY(SmsHelper::pasteDirectory().startsWith(m_runtime.path()));
++    QVERIFY(!SmsHelper::pasteDirectory().startsWith(QStringLiteral("/tmp/kdeconnect")));
++    const QFileInfo dir(SmsHelper::pasteDirectory());
++    if (dir.exists()) {
++        QCOMPARE(dir.permissions() & (QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther), QFileDevice::Permissions());
++    }
++}
++
++void SmsPasteTest::testSaveRunsOnAWorker()
++{
++    // The function the async paste hands to QtConcurrent works off the GUI thread
++    QImage img(800, 600, QImage::Format_ARGB32);
++    img.fill(Qt::transparent);
++    QThread *saver = nullptr;
++    QFuture<QUrl> future = QtConcurrent::run([&saver, img]() {
++        saver = QThread::currentThread();
++        return SmsHelper::savePastedImage(img, SmsHelper::pasteDirectory());
++    });
++    // Poll instead of result(): a blocking wait may run the task on this thread
++    QTRY_VERIFY_WITH_TIMEOUT(future.isFinished(), 10000);
++    QVERIFY(saver && saver != QThread::currentThread());
++    QVERIFY(QFileInfo::exists(future.result().toLocalFile()));
++}
++
++void SmsPasteTest::testSaveFailureIsReported()
++{
++    // The paste folder cannot be created (here: a plain file sits where the
++    // folder should be, which stops root too). The user must get a message,
++    // never a paste that silently does nothing.
++    QTemporaryDir broken;
++    QVERIFY(broken.isValid());
++    QFile::setPermissions(broken.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
++    QFile blocker(broken.filePath(QStringLiteral("kdeconnect-sms-paste")));
++    QVERIFY(blocker.open(QIODevice::WriteOnly));
++    blocker.close();
++
++    QString error;
++    QImage img(64, 64, QImage::Format_RGB32);
++    img.fill(Qt::green);
++    QVERIFY(SmsHelper::savePastedImage(img, blocker.fileName(), &error).isEmpty());
++    QVERIFY(!error.isEmpty());
++
++    const QByteArray oldRuntime = qgetenv("XDG_RUNTIME_DIR");
++    qputenv("XDG_RUNTIME_DIR", broken.path().toLocal8Bit());
++    QCOMPARE(SmsHelper::pasteDirectory(), blocker.fileName());
++
++    SmsHelper helper;
++    QGuiApplication::clipboard()->setImage(img);
++    QSignalSpy ready(&helper, &SmsHelper::clipboardAttachmentsReady);
++    QSignalSpy failed(&helper, &SmsHelper::clipboardPasteFailed);
++    const int id = helper.pasteClipboardAttachments();
++    QVERIFY(id > 0); // taken as an image paste, not as text
++    QVERIFY(failed.wait(10000));
++    qputenv("XDG_RUNTIME_DIR", oldRuntime);
++    QCOMPARE(failed.first().at(0).toInt(), id);
++    const QString message = failed.first().at(1).toString();
++    QVERIFY2(message.startsWith(QStringLiteral("Could not paste the image")), qPrintable(message));
++    QVERIFY2(message.contains(blocker.fileName()), qPrintable(message)); // says where
++    QCOMPARE(ready.count(), 0);
++}
++
++QTEST_MAIN(SmsPasteTest)
++#include "smspastetest.moc"
+diff --git a/tests/smspluginsynctest.cpp b/tests/smspluginsynctest.cpp
+new file mode 100644
+index 0000000..55d79f4
+--- /dev/null
++++ b/tests/smspluginsynctest.cpp
+@@ -0,0 +1,571 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "core/kdeconnectplugin.h"
++#include "core/kdeconnectpluginconfig.h"
++#include "core/networkpacket.h"
++#include "testdevice.h"
++
++#include <KPluginFactory>
++#include <KPluginMetaData>
++
++#include <QDBusAbstractAdaptor>
++#include <QDBusConnection>
++#include <QDBusConnectionInterface>
++#include <QDateTime>
++#include <QHash>
++#include <QDir>
++#include <QFile>
++#include <QImage>
++#include <QPointer>
++#include <QSignalSpy>
++#include <QStandardPaths>
++#include <QTemporaryDir>
++#include <QTest>
++#include <QThread>
++
++/**
++ * A stand-in desktop notification server (org.freedesktop.Notifications) on
++ * the test's session bus, so the test sees what KNotification really shows
++ * and closes. The package tests run under dbus-run-session.
++ */
++class FakeNotificationServer : public QObject
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.freedesktop.Notifications")
++public:
++    QHash<uint, QString> open; // id -> body of every notification currently shown
++    QStringList bodies; // every body ever shown, in order
++    uint nextId = 1;
++
++public Q_SLOTS:
++    QStringList GetCapabilities()
++    {
++        return {QStringLiteral("body"), QStringLiteral("actions"), QStringLiteral("persistence")};
++    }
++    QString GetServerInformation(QString &vendor, QString &version, QString &specVersion)
++    {
++        vendor = QStringLiteral("test");
++        version = QStringLiteral("1");
++        specVersion = QStringLiteral("1.2");
++        return QStringLiteral("fake");
++    }
++    uint Notify(const QString &, uint replacesId, const QString &, const QString &, const QString &body, const QStringList &, const QVariantMap &, int)
++    {
++        const uint id = replacesId ? replacesId : nextId++;
++        open[id] = body;
++        bodies << body;
++        return id;
++    }
++    void CloseNotification(uint id)
++    {
++        if (open.remove(id)) {
++            Q_EMIT NotificationClosed(id, 3); // closed by a call to CloseNotification
++        }
++    }
++
++Q_SIGNALS:
++    void NotificationClosed(uint id, uint reason);
++    void ActionInvoked(uint id, const QString &actionKey);
++};
++
++/**
++ * A link that is up but cannot carry anything: every sendPacket fails.
++ */
++class FailingTestDevice : public TestDevice
++{
++public:
++    using TestDevice::TestDevice;
++    bool sendPacket(NetworkPacket &) override
++    {
++        ++attempts;
++        return false;
++    }
++    int attempts = 0;
++};
++
++/**
++ * Drives the real kdeconnect_sms plugin against a fake device that records
++ * every packet the plugin sends, the way a link to a phone would carry them.
++ */
++class SmsPluginSyncTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void initTestCase();
++    void init();
++    void cleanup();
++    void testConnectRequestsConversations();
++    void testHeartbeatIsLightRequest();
++    void testReconnectRequestsAgain();
++    void testSyncStatusOverDbusAdaptor();
++    void testUnreadableAttachmentReportsFailure();
++    void testImageIsShrunkBeforeSending();
++    void testSendFromWorkerThread();
++    void testStallNotifiedOncePerEpisodeAndCleared();
++    void testFastLinkFlapNotifies();
++    void testEverySendFailingNotifies();
++    void testDisconnectClosesStallNotification();
++
++private:
++    int syncState();
++    QImage makePhoto();
++    KdeConnectPlugin *loadPlugin();
++    KdeConnectPlugin *loadPluginFor(Device *device);
++    void configure(Device *device);
++    QObject *conversationsAdaptor();
++    void feedMessage(qint64 threadId);
++
++    TestDevice *m_device = nullptr;
++    KdeConnectPlugin *m_plugin = nullptr;
++    FakeNotificationServer *m_notifications = nullptr;
++    QTemporaryDir m_dir;
++};
++
++void SmsPluginSyncTest::initTestCase()
++{
++    QStandardPaths::setTestModeEnabled(true);
++    QVERIFY(m_dir.isValid());
++    // KNotification drops an event it has no config for at once; give it ours
++    // (test-mode data dir) so the notification lives until the plugin closes it
++    const QString knotifyDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QStringLiteral("/knotifications6");
++    QVERIFY(QDir().mkpath(knotifyDir));
++    QFile::remove(knotifyDir + QStringLiteral("/kdeconnect.notifyrc"));
++    QVERIFY(QFile::copy(QStringLiteral(KDECONNECT_NOTIFYRC_PATH), knotifyDir + QStringLiteral("/kdeconnect.notifyrc")));
++
++    QDBusConnection bus = QDBusConnection::sessionBus();
++    if (bus.isConnected() && !bus.interface()->isServiceRegistered(QStringLiteral("org.freedesktop.Notifications"))) {
++        auto *server = new FakeNotificationServer;
++        server->setParent(this);
++        if (bus.registerObject(QStringLiteral("/org/freedesktop/Notifications"), server, QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals)
++            && bus.registerService(QStringLiteral("org.freedesktop.Notifications"))) {
++            m_notifications = server;
++        }
++    }
++    qInfo() << "fake notification server:" << (m_notifications ? "on the session bus" : "none (no session bus)");
++}
++
++void SmsPluginSyncTest::configure(Device *device)
++{
++    // One-second heartbeat so the test does not wait five minutes
++    KdeConnectPluginConfig config(device->id(), QStringLiteral("kdeconnect_sms"));
++    config.set(QStringLiteral("syncHeartbeatSeconds"), 1);
++    // and a one-second answer window so staleness shows up within the test
++    config.set(QStringLiteral("syncStaleSeconds"), 1);
++}
++
++void SmsPluginSyncTest::init()
++{
++    // The sync clock outlives the plugin (per device, for the daemon's lifetime):
++    // one device per test, so no test inherits another's unanswered requests
++    m_device = new TestDevice(nullptr, QStringLiteral("smssynctest_%1").arg(QLatin1String(QTest::currentTestFunction())));
++    configure(m_device);
++    m_plugin = loadPlugin();
++    QVERIFY(m_plugin);
++}
++
++void SmsPluginSyncTest::cleanup()
++{
++    delete m_plugin;
++    m_plugin = nullptr;
++    delete m_device;
++    m_device = nullptr;
++}
++
++KdeConnectPlugin *SmsPluginSyncTest::loadPlugin()
++{
++    return loadPluginFor(m_device);
++}
++
++KdeConnectPlugin *SmsPluginSyncTest::loadPluginFor(Device *device)
++{
++    const KPluginMetaData data(QStringLiteral(KDECONNECT_SMS_PLUGIN_PATH));
++    if (!data.isValid()) {
++        qWarning() << "invalid plugin metadata" << KDECONNECT_SMS_PLUGIN_PATH;
++        return nullptr;
++    }
++    const QStringList outgoing = data.value(QStringLiteral("X-KdeConnect-OutgoingPacketType"), QStringList());
++    const QVariantList args{QVariant::fromValue<Device *>(device), QStringLiteral("kdeconnect_sms"), outgoing, data.iconName()};
++    auto result = KPluginFactory::instantiatePlugin<KdeConnectPlugin>(data, device, args);
++    if (!result) {
++        qWarning() << result.errorText;
++    }
++    return result.plugin;
++}
++
++QObject *SmsPluginSyncTest::conversationsAdaptor()
++{
++    // Every plugin instance adds its adaptor to the device; QtDBus serves the
++    // newest one for the interface, so that is the one the SMS app talks to
++    QObject *newest = nullptr;
++    const auto adaptors = m_device->findChildren<QDBusAbstractAdaptor *>();
++    for (QDBusAbstractAdaptor *adaptor : adaptors) {
++        if (QLatin1String(adaptor->metaObject()->className()) == QLatin1String("ConversationsDbusInterface")) {
++            newest = adaptor;
++        }
++    }
++    return newest;
++}
++
++void SmsPluginSyncTest::feedMessage(qint64 threadId)
++{
++    const QVariantMap message{
++        {QStringLiteral("event"), 1},
++        {QStringLiteral("body"), QStringLiteral("hello")},
++        {QStringLiteral("addresses"), QVariantList{QVariantMap{{QStringLiteral("address"), QStringLiteral("+15095550100")}}}},
++        {QStringLiteral("date"), QDateTime::currentMSecsSinceEpoch()},
++        {QStringLiteral("type"), 1},
++        {QStringLiteral("read"), 1},
++        {QStringLiteral("thread_id"), threadId},
++        {QStringLiteral("_id"), 7},
++    };
++    NetworkPacket np(QStringLiteral("kdeconnect.sms.messages"), {{QStringLiteral("version"), 2}, {QStringLiteral("messages"), QVariantList{message}}});
++    m_plugin->receivePacket(np);
++}
++
++void SmsPluginSyncTest::testConnectRequestsConversations()
++{
++    QCOMPARE(m_device->getSentPackets(), 0);
++    m_plugin->connected();
++    QCOMPARE(m_device->getSentPackets(), 1);
++    QCOMPARE(m_device->getLastPacket()->type(), QStringLiteral("kdeconnect.sms.request_conversations"));
++}
++
++void SmsPluginSyncTest::testHeartbeatIsLightRequest()
++{
++    m_plugin->connected();
++    feedMessage(42);
++    const int before = m_device->getSentPackets();
++    QTRY_VERIFY_WITH_TIMEOUT(m_device->getSentPackets() > before, 3000);
++    NetworkPacket *np = m_device->getLastPacket();
++    QCOMPARE(np->type(), QStringLiteral("kdeconnect.sms.request_conversation"));
++    QCOMPARE(np->get<qint64>(QStringLiteral("threadID")), qint64(42));
++    QCOMPARE(np->get<qint64>(QStringLiteral("numberToRequest")), qint64(1));
++}
++
++void SmsPluginSyncTest::testReconnectRequestsAgain()
++{
++    m_plugin->connected();
++    QCOMPARE(m_device->getLastPacket()->type(), QStringLiteral("kdeconnect.sms.request_conversations"));
++    // Device::reloadPlugins destroys the plugin when the link drops and makes a new one when it is back
++    delete m_plugin;
++    m_plugin = loadPlugin();
++    QVERIFY(m_plugin);
++    const int before = m_device->getSentPackets();
++    m_plugin->connected();
++    QCOMPARE(m_device->getSentPackets(), before + 1);
++    QCOMPARE(m_device->getLastPacket()->type(), QStringLiteral("kdeconnect.sms.request_conversations"));
++}
++
++void SmsPluginSyncTest::testSyncStatusOverDbusAdaptor()
++{
++    QObject *adaptor = conversationsAdaptor();
++    QVERIFY(adaptor);
++    QSignalSpy status(adaptor, SIGNAL(syncStatusChanged()));
++    m_plugin->connected();
++    QVERIFY(status.count() >= 1);
++
++    qlonglong lastRequest = 0;
++    qlonglong lastReply = 0;
++    QVERIFY(QMetaObject::invokeMethod(adaptor, "lastSyncRequest", Q_RETURN_ARG(qlonglong, lastRequest)));
++    QVERIFY(QMetaObject::invokeMethod(adaptor, "lastSyncReply", Q_RETURN_ARG(qlonglong, lastReply)));
++    QVERIFY(lastRequest > 0);
++    QVERIFY(lastReply < lastRequest); // asked, not answered yet: the app shows this as stale after a while
++
++    QVariantMap sync;
++    QVERIFY(QMetaObject::invokeMethod(adaptor, "syncStatus", Q_RETURN_ARG(QVariantMap, sync)));
++    QCOMPARE(sync.value(QStringLiteral("unansweredSince")).toLongLong(), lastRequest);
++    QVERIFY(sync.value(QStringLiteral("connectedSince")).toLongLong() > 0);
++    QCOMPARE(sync.value(QStringLiteral("staleAfter")).toLongLong(), qint64(1000));
++
++    feedMessage(42);
++    QVERIFY(QMetaObject::invokeMethod(adaptor, "lastSyncReply", Q_RETURN_ARG(qlonglong, lastReply)));
++    QVERIFY(lastReply >= lastRequest);
++    QCOMPARE(syncState(), 1); // SmsSyncStatus::Answered
++    QVERIFY(QMetaObject::invokeMethod(adaptor, "syncStatus", Q_RETURN_ARG(QVariantMap, sync)));
++    QCOMPARE(sync.value(QStringLiteral("unansweredSince")).toLongLong(), qint64(0));
++}
++
++void SmsPluginSyncTest::testUnreadableAttachmentReportsFailure()
++{
++    QObject *adaptor = conversationsAdaptor();
++    QVERIFY(adaptor);
++    QSignalSpy failed(adaptor, SIGNAL(messageSendFailed(QString)));
++    const int before = m_device->getSentPackets();
++    QVERIFY(QMetaObject::invokeMethod(m_plugin,
++                                      "sendSms",
++                                      Q_ARG(QVariantList, QVariantList()),
++                                      Q_ARG(QString, QStringLiteral("hi")),
++                                      Q_ARG(QVariantList, QVariantList{m_dir.filePath(QStringLiteral("missing.jpg"))}),
++                                      Q_ARG(qint64, -1)));
++    QVERIFY(failed.wait(5000));
++    QVERIFY(!failed.first().first().toString().isEmpty());
++    QCOMPARE(m_device->getSentPackets(), before); // nothing half-built went out
++}
++
++int SmsPluginSyncTest::syncState()
++{
++    QVariantMap sync;
++    if (!QMetaObject::invokeMethod(conversationsAdaptor(), "syncStatus", Q_RETURN_ARG(QVariantMap, sync))) {
++        return -1;
++    }
++    return sync.value(QStringLiteral("state")).toInt();
++}
++
++QImage SmsPluginSyncTest::makePhoto()
++{
++    QImage image(4000, 3000, QImage::Format_RGB32);
++    for (int y = 0; y < image.height(); ++y) {
++        QRgb *line = reinterpret_cast<QRgb *>(image.scanLine(y));
++        for (int x = 0; x < image.width(); ++x) {
++            line[x] = qRgb((x ^ y) & 0xff, (x * 7) & 0xff, (y * 3) & 0xff);
++        }
++    }
++    return image;
++}
++
++void SmsPluginSyncTest::testImageIsShrunkBeforeSending()
++{
++    const QImage image = makePhoto();
++    const QString path = m_dir.filePath(QStringLiteral("photo.jpg"));
++    QVERIFY(image.save(path, "JPEG", 97));
++    QVERIFY(QFileInfo(path).size() > 600 * 1000); // the old desktop refused this outright
++
++    const int before = m_device->getSentPackets();
++    QVERIFY(QMetaObject::invokeMethod(m_plugin,
++                                      "sendSms",
++                                      Q_ARG(QVariantList, QVariantList()),
++                                      Q_ARG(QString, QStringLiteral("look")),
++                                      Q_ARG(QVariantList, QVariantList{path}),
++                                      Q_ARG(qint64, -1)));
++    // The work runs on a worker thread; the event loop stays free meanwhile
++    QTRY_VERIFY_WITH_TIMEOUT(m_device->getSentPackets() > before, 20000);
++    NetworkPacket *np = m_device->getLastPacket();
++    QCOMPARE(np->type(), QStringLiteral("kdeconnect.sms.request"));
++    const QVariantList attachments = np->get<QVariantList>(QStringLiteral("attachments"));
++    QCOMPARE(attachments.size(), 1);
++    const QVariantMap attachment = attachments.first().toMap();
++    QCOMPARE(attachment.value(QStringLiteral("mimeType")).toString(), QStringLiteral("image/jpeg"));
++    const QByteArray jpeg = QByteArray::fromBase64(attachment.value(QStringLiteral("base64EncodedFile")).toString().toLatin1());
++    qInfo() << "input" << QFileInfo(path).size() << "bytes, sent" << jpeg.size() << "bytes";
++    QVERIFY(jpeg.size() <= 300 * 1000);
++    QImage sent;
++    QVERIFY(sent.loadFromData(jpeg, "JPEG"));
++    QVERIFY(qAbs(sent.width() * 3 - sent.height() * 4) <= 4);
++}
++
++void SmsPluginSyncTest::testSendFromWorkerThread()
++{
++    // conversationsdbusinterface's cache-miss reply path calls sendSms from a
++    // QThread::create worker that has no event loop. The message (with a
++    // photo, which needs the attachment watcher) must still go out.
++    const QString path = m_dir.filePath(QStringLiteral("worker-photo.jpg"));
++    QVERIFY(makePhoto().save(path, "JPEG", 97));
++    const int before = m_device->getSentPackets();
++    bool invoked = false;
++    QThread *worker = QThread::create([this, path, &invoked]() {
++        invoked = QMetaObject::invokeMethod(m_plugin,
++                                            "sendSms",
++                                            Qt::DirectConnection,
++                                            Q_ARG(QVariantList, QVariantList()),
++                                            Q_ARG(QString, QStringLiteral("from a worker")),
++                                            Q_ARG(QVariantList, QVariantList{path}),
++                                            Q_ARG(qint64, -1));
++    });
++    worker->start();
++    QVERIFY(worker->wait(5000));
++    delete worker;
++    QVERIFY(invoked);
++    QTRY_VERIFY_WITH_TIMEOUT(m_device->getSentPackets() > before, 20000);
++    NetworkPacket *np = m_device->getLastPacket();
++    QCOMPARE(np->type(), QStringLiteral("kdeconnect.sms.request"));
++    QCOMPARE(np->get<QString>(QStringLiteral("messageBody")), QStringLiteral("from a worker"));
++    QCOMPARE(np->get<QVariantList>(QStringLiteral("attachments")).size(), 1);
++
++    // and a text-only message from a worker goes out too
++    const int beforeText = m_device->getSentPackets();
++    QThread *textWorker = QThread::create([this]() {
++        QMetaObject::invokeMethod(m_plugin,
++                                  "sendSms",
++                                  Qt::DirectConnection,
++                                  Q_ARG(QVariantList, QVariantList()),
++                                  Q_ARG(QString, QStringLiteral("text from a worker")),
++                                  Q_ARG(QVariantList, QVariantList()),
++                                  Q_ARG(qint64, -1));
++    });
++    textWorker->start();
++    QVERIFY(textWorker->wait(5000));
++    delete textWorker;
++    QTRY_VERIFY_WITH_TIMEOUT(m_device->getSentPackets() > beforeText, 5000);
++    QCOMPARE(m_device->getLastPacket()->get<QString>(QStringLiteral("messageBody")), QStringLiteral("text from a worker"));
++}
++
++void SmsPluginSyncTest::testStallNotifiedOncePerEpisodeAndCleared()
++{
++    // Earlier tests may have left this device stale; a reply starts us clean
++    m_plugin->connected();
++    feedMessage(42);
++    QCOMPARE(syncState(), 1); // Answered
++
++    QSignalSpy notified(m_plugin, SIGNAL(syncStallNotified(bool)));
++    // The phone goes silent: heartbeats go out every second, nothing comes back
++    QTRY_COMPARE_WITH_TIMEOUT(notified.count(), 1, 5000);
++    QCOMPARE(notified.first().first().toBool(), true);
++    QCOMPARE(syncState(), 4); // Stale
++
++    // Several more unanswered heartbeats: still one notification, and the
++    // state over D-Bus never drops out of the warning
++    for (int i = 0; i < 16; ++i) {
++        QTest::qWait(200);
++        QCOMPARE(syncState(), 4);
++    }
++    QCOMPARE(notified.count(), 1);
++    QVERIFY(m_device->getSentPackets() >= 4);
++
++    // The phone answers: the notification is taken away
++    feedMessage(42);
++    QCOMPARE(notified.count(), 2);
++    QCOMPARE(notified.last().first().toBool(), false);
++    QCOMPARE(syncState(), 1);
++
++    // A reconnect where the phone never answers: a new episode, its own state
++    delete m_plugin;
++    m_plugin = loadPlugin();
++    QVERIFY(m_plugin);
++    QSignalSpy notifiedAgain(m_plugin, SIGNAL(syncStallNotified(bool)));
++    QTest::qWait(20); // the link comes up after the last answer, not in the same millisecond
++    m_plugin->connected();
++    QCOMPARE(syncState(), 2); // Waiting: the answer from before does not count for this link
++    QTRY_COMPARE_WITH_TIMEOUT(notifiedAgain.count(), 1, 5000);
++    QCOMPARE(syncState(), 3); // NeverAnswered
++    feedMessage(42);
++    QCOMPARE(notifiedAgain.count(), 2);
++}
++
++void SmsPluginSyncTest::testFastLinkFlapNotifies()
++{
++    // The link drops and comes back every 0.4 s, faster than the 1 s window,
++    // and the phone never answers. Every drop destroys the plugin and every
++    // link-up makes a new one (Device::reloadPlugins). The warning and the
++    // notification must still come.
++    int shown = 0;
++    int lastState = -1;
++    for (int cycle = 0; cycle < 12 && shown == 0; ++cycle) {
++        if (!m_plugin) {
++            m_plugin = loadPlugin();
++            QVERIFY(m_plugin);
++        }
++        QSignalSpy notified(m_plugin, SIGNAL(syncStallNotified(bool)));
++        m_plugin->connected();
++        QTest::qWait(400);
++        lastState = syncState();
++        for (const QList<QVariant> &args : std::as_const(notified)) {
++            if (args.first().toBool()) {
++                ++shown;
++            }
++        }
++        if (shown == 0) {
++            delete m_plugin;
++            m_plugin = nullptr;
++            QTest::qWait(20); // disconnected for a moment
++        }
++    }
++    QVERIFY2(shown == 1, "a link flapping faster than the window never raised the notification");
++    QCOMPARE(lastState, 3); // NeverAnswered
++}
++
++void SmsPluginSyncTest::testEverySendFailingNotifies()
++{
++    // A link that is up but where every sendPacket fails: nothing goes out,
++    // nothing comes back, and the user must be told
++    delete m_plugin;
++    m_plugin = nullptr;
++    FailingTestDevice failing(nullptr, QStringLiteral("smssynctest_failingdevice"));
++    configure(&failing);
++    KdeConnectPlugin *plugin = loadPluginFor(&failing);
++    QVERIFY(plugin);
++    QSignalSpy notified(plugin, SIGNAL(syncStallNotified(bool)));
++    plugin->connected();
++    QVERIFY(failing.attempts >= 1);
++    QTRY_COMPARE_WITH_TIMEOUT(notified.count(), 1, 5000);
++    QCOMPARE(notified.first().first().toBool(), true);
++
++    QObject *adaptor = nullptr;
++    const auto adaptors = failing.findChildren<QDBusAbstractAdaptor *>();
++    for (QDBusAbstractAdaptor *a : adaptors) {
++        if (QLatin1String(a->metaObject()->className()) == QLatin1String("ConversationsDbusInterface")) {
++            adaptor = a;
++        }
++    }
++    QVERIFY(adaptor);
++    QVariantMap sync;
++    QVERIFY(QMetaObject::invokeMethod(adaptor, "syncStatus", Q_RETURN_ARG(QVariantMap, sync)));
++    QCOMPARE(sync.value(QStringLiteral("state")).toInt(), 3); // NeverAnswered
++    QVERIFY(sync.value(QStringLiteral("unansweredSince")).toLongLong() > 0);
++    QCOMPARE(sync.value(QStringLiteral("lastRequest")).toLongLong(), qint64(0)); // nothing was ever actually asked
++    QTest::qWait(1500);
++    QVERIFY(failing.attempts >= 2); // the heartbeat keeps trying
++    QCOMPARE(notified.count(), 1); // one notification for the episode
++    delete plugin;
++}
++
++void SmsPluginSyncTest::testDisconnectClosesStallNotification()
++{
++    QSignalSpy created(m_plugin, SIGNAL(syncStallNotificationCreated(QObject *)));
++    QSignalSpy notified(m_plugin, SIGNAL(syncStallNotified(bool)));
++    m_plugin->connected();
++    QTRY_COMPARE_WITH_TIMEOUT(created.count(), 1, 5000);
++    QPointer<QObject> notification = created.first().first().value<QObject *>();
++    QVERIFY(notification);
++    QCOMPARE(notified.count(), 1);
++    if (m_notifications) {
++        // really on screen: the desktop's notification server got it
++        QTRY_COMPARE_WITH_TIMEOUT(m_notifications->open.size(), 1, 3000);
++        QVERIFY(m_notifications->open.begin().value().contains(QStringLiteral("not updating")));
++    }
++
++    // The phone disconnects: the plugin goes away. The persistent notification
++    // must not stay behind saying something about a phone we no longer talk to.
++    delete m_plugin;
++    m_plugin = nullptr;
++    QCOMPARE(notified.count(), 2);
++    QCOMPARE(notified.last().first().toBool(), false);
++    if (m_notifications) {
++        // and it is really gone from the screen
++        QTRY_COMPARE_WITH_TIMEOUT(m_notifications->open.size(), 0, 3000);
++    } else {
++        qWarning() << "no session bus: only the plugin's own bookkeeping was checked";
++    }
++
++    // It comes back and still does not answer: the episode logic decides afresh
++    QTest::qWait(300);
++    m_plugin = loadPlugin();
++    QVERIFY(m_plugin);
++    QSignalSpy createdAgain(m_plugin, SIGNAL(syncStallNotificationCreated(QObject *)));
++    QSignalSpy notifiedAgain(m_plugin, SIGNAL(syncStallNotified(bool)));
++    m_plugin->connected();
++    // The clock carried over (minus the disconnected time), so it warns again soon
++    QTRY_COMPARE_WITH_TIMEOUT(createdAgain.count(), 1, 5000);
++    QCOMPARE(notifiedAgain.first().first().toBool(), true);
++    QCOMPARE(syncState(), 3);
++    uint shownId = 0;
++    if (m_notifications) {
++        QTRY_COMPARE_WITH_TIMEOUT(m_notifications->open.size(), 1, 3000);
++        shownId = m_notifications->open.begin().key();
++    }
++    // and a reply takes it away (the 1 s test window can start a new episode
++    // right after, so watch this one notification)
++    feedMessage(42);
++    QCOMPARE(notifiedAgain.count(), 2);
++    QCOMPARE(syncState(), 1);
++    if (m_notifications) {
++        QTRY_VERIFY_WITH_TIMEOUT(!m_notifications->open.contains(shownId), 3000);
++    }
++}
++
++QTEST_MAIN(SmsPluginSyncTest)
++#include "smspluginsynctest.moc"
+diff --git a/tests/smssyncstatustest.cpp b/tests/smssyncstatustest.cpp
+new file mode 100644
+index 0000000..44b74ed
+--- /dev/null
++++ b/tests/smssyncstatustest.cpp
+@@ -0,0 +1,366 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "plugins/sms/smssynckeeper.h"
++#include "plugins/sms/smssyncstatus.h"
++#include "smsapp/smshelper.h"
++
++#include <QSignalSpy>
++#include <QTest>
++
++#include <memory>
++
++/**
++ * What the SMS app shows, driven through the daemon's SmsSyncKeeper with a
++ * fake clock: the app evaluates SmsSyncStatus::evaluate() on the times the
++ * daemon publishes and turns the state into SmsHelper::syncStatusText(),
++ * exactly as ConversationListModel::updateSyncStatusText() does.
++ *
++ * The bug this guards against: every unanswered heartbeat used to move the
++ * "last request" time, so the warning showed for 3 of every 5 minutes and
++ * nothing at all was shown when the phone had never answered.
++ */
++class SmsSyncStatusTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testNeverAnsweredWarningStaysUp();
++    void testStoppedAnsweringWarningStaysUpUntilReply();
++    void testHealthyPhoneNeverWarns();
++    void testReconnectGivesAFreshWindow();
++    void testWordingSaysWhatTheTimeMeans();
++    void testFastLinkFlapStillWarns();
++    void testPhoneThatWasAwayGetsItsWindow();
++    void testDebouncedLinkUpNeverReadsAnswered();
++    void testFailedSendsCountAsNotSyncing();
++
++private:
++    struct Sample {
++        qint64 t;
++        int state;
++        QString text;
++    };
++    // The app's view of the keeper at the current fake time
++    Sample appView(const SmsSyncKeeper &keeper) const
++    {
++        const int state = SmsSyncStatus::evaluate(m_now,
++                                                  keeper.unansweredSinceMs(),
++                                                  keeper.lastReplyMs(),
++                                                  keeper.connectedSinceMs(),
++                                                  keeper.staleAfterMs(),
++                                                  keeper.unansweredPausedMs());
++        return {m_now, state, SmsHelper::syncStatusText(state, keeper.lastReplyMs(), keeper.unansweredSinceMs(), keeper.connectedSinceMs())};
++    }
++    // Advance the fake clock in 15 s steps (the app's re-check interval), running the
++    // 5 min heartbeat when it is due, and sample what the app would show at each step.
++    QList<Sample> run(SmsSyncKeeper &keeper, qint64 forMs)
++    {
++        QList<Sample> samples;
++        const qint64 end = m_now + forMs;
++        while (m_now < end) {
++            m_now += 15 * 1000;
++            if (m_now - m_lastBeat >= HEARTBEAT_MS) {
++                m_lastBeat = m_now;
++                keeper.heartbeat();
++            }
++            keeper.checkState();
++            samples << appView(keeper);
++        }
++        return samples;
++    }
++    void makeKeeper(SmsSyncKeeper &keeper, bool answers)
++    {
++        keeper.setClock([this]() {
++            return m_now;
++        });
++        keeper.setNewestThreadProvider([]() {
++            return qint64(42);
++        });
++        keeper.setFullSyncIntervalMs(30 * 60 * 1000);
++        m_answers = answers;
++        auto request = [this, &keeper]() {
++            keeper.noteRequest();
++            if (m_answers) {
++                keeper.noteReply();
++            }
++        };
++        connect(&keeper, &SmsSyncKeeper::wantFullSync, &keeper, request);
++        connect(&keeper, &SmsSyncKeeper::wantLightSync, &keeper, request);
++    }
++
++    static constexpr qint64 HEARTBEAT_MS = 5 * 60 * 1000;
++    static constexpr qint64 START = 1762560000000; // a fixed day, so times format the same way
++    qint64 m_now = START;
++    qint64 m_lastBeat = START;
++    bool m_answers = true;
++};
++
++void SmsSyncStatusTest::testNeverAnsweredWarningStaysUp()
++{
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper keeper(0); // heartbeat driven by hand
++    makeKeeper(keeper, false);
++    QSignalSpy states(&keeper, &SmsSyncKeeper::stateChanged);
++
++    keeper.linkUp();
++    const qint64 connected = m_now;
++    QCOMPARE(appView(keeper).state, int(SmsSyncStatus::Waiting));
++    QVERIFY(!appView(keeper).text.isEmpty()); // visible from the first second, never blank
++
++    // Forty minutes, eight unanswered heartbeats
++    const QList<Sample> samples = run(keeper, 40 * 60 * 1000);
++    int warnings = 0;
++    for (const Sample &s : samples) {
++        QVERIFY2(!s.text.isEmpty(), qPrintable(QStringLiteral("blank status at +%1 s").arg((s.t - connected) / 1000)));
++        if (s.t - connected < SmsSyncStatus::DEFAULT_STALE_AFTER_MS) {
++            QCOMPARE(s.state, int(SmsSyncStatus::Waiting));
++        } else {
++            // Continuous from the end of the window on: no gap after any heartbeat
++            QVERIFY2(s.state == SmsSyncStatus::NeverAnswered, qPrintable(QStringLiteral("not warning at +%1 s").arg((s.t - connected) / 1000)));
++            QCOMPARE(s.text, samples.last().text); // and it does not change its story
++            ++warnings;
++        }
++    }
++    QVERIFY(warnings > 150);
++    QCOMPARE(keeper.unansweredSinceMs(), connected); // the first unanswered request, never moved
++    QVERIFY(keeper.lastRequestMs() > connected); // while the heartbeats kept asking
++    // Waiting, then NeverAnswered, and nothing else: one episode
++    QCOMPARE(states.count(), 2);
++    QCOMPARE(states.at(1).first().toInt(), int(SmsSyncStatus::NeverAnswered));
++}
++
++void SmsSyncStatusTest::testStoppedAnsweringWarningStaysUpUntilReply()
++{
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper keeper(0);
++    makeKeeper(keeper, true);
++    keeper.linkUp();
++    run(keeper, 12 * 60 * 1000);
++    QCOMPARE(appView(keeper).state, int(SmsSyncStatus::Answered));
++    const qint64 lastAnswer = keeper.lastReplyMs();
++
++    // The phone goes silent (app force-stopped, link still up)
++    m_answers = false;
++    QSignalSpy states(&keeper, &SmsSyncKeeper::stateChanged);
++    const QList<Sample> silent = run(keeper, 31 * 60 * 1000);
++    const qint64 firstUnanswered = keeper.unansweredSinceMs();
++    QVERIFY(firstUnanswered > lastAnswer);
++    bool warned = false;
++    for (const Sample &s : silent) {
++        QVERIFY(!s.text.isEmpty());
++        if (s.t - firstUnanswered >= SmsSyncStatus::DEFAULT_STALE_AFTER_MS) {
++            QVERIFY2(s.state == SmsSyncStatus::Stale, qPrintable(QStringLiteral("gap at +%1 s").arg((s.t - firstUnanswered) / 1000)));
++            QVERIFY(s.text.contains(SmsHelper::shortTime(lastAnswer)));
++            warned = true;
++        } else if (warned) {
++            QFAIL("warning went away without a reply");
++        }
++    }
++    QVERIFY(warned);
++    QCOMPARE(states.count(), 1); // Answered -> Stale once, held through six heartbeats
++
++    // The phone answers again: the warning clears at once
++    m_answers = true;
++    keeper.heartbeat();
++    QCOMPARE(appView(keeper).state, int(SmsSyncStatus::Answered));
++    QCOMPARE(keeper.unansweredSinceMs(), qint64(0));
++    QCOMPARE(states.count(), 2);
++}
++
++void SmsSyncStatusTest::testHealthyPhoneNeverWarns()
++{
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper keeper(0);
++    makeKeeper(keeper, true);
++    keeper.linkUp();
++    const QList<Sample> samples = run(keeper, 2 * 60 * 60 * 1000);
++    for (const Sample &s : samples) {
++        QCOMPARE(s.state, int(SmsSyncStatus::Answered));
++    }
++}
++
++void SmsSyncStatusTest::testReconnectGivesAFreshWindow()
++{
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper first(0);
++    makeKeeper(first, true);
++    first.linkUp();
++    run(first, 10 * 60 * 1000);
++
++    // Away for an hour; the plugin is recreated with the restored times
++    m_now += 60 * 60 * 1000;
++    m_lastBeat = m_now;
++    SmsSyncKeeper second(0, first.lastRequestMs(), first.lastReplyMs());
++    makeKeeper(second, false);
++    second.linkUp();
++    // The answer from the last connection does not count for this one...
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::Waiting));
++    // ...and after the window, it says the phone has not answered on this connection
++    run(second, 3 * 60 * 1000);
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::NeverAnswered));
++}
++
++void SmsSyncStatusTest::testWordingSaysWhatTheTimeMeans()
++{
++    const qint64 t = START;
++    QCOMPARE(SmsHelper::syncStatusText(SmsSyncStatus::Unknown, 0, 0, 0), QString());
++    // A keep-alive answer is not "last update": say only that the phone answered
++    const QString answered = SmsHelper::syncStatusText(SmsSyncStatus::Answered, t, 0, t);
++    QVERIFY(answered.startsWith(QStringLiteral("Phone answered at ")));
++    QVERIFY(!answered.contains(QStringLiteral("update"), Qt::CaseInsensitive));
++    QVERIFY(SmsHelper::syncStatusText(SmsSyncStatus::Waiting, 0, t, t).contains(QStringLiteral("waiting")));
++    QVERIFY(SmsHelper::syncStatusText(SmsSyncStatus::NeverAnswered, 0, t, t).startsWith(QStringLiteral("Not syncing")));
++    QVERIFY(SmsHelper::syncStatusText(SmsSyncStatus::Stale, t, t + 1, t).startsWith(QStringLiteral("Not syncing")));
++}
++
++void SmsSyncStatusTest::testFastLinkFlapStillWarns()
++{
++    // The link drops for 2 s every 60 s and the phone never answers. Each drop
++    // destroys the plugin (Device::reloadPlugins) and the next link makes a new
++    // one from the per-device store, exactly what SmsPlugin does. Before this
++    // fix every link-up restarted the 2 min window, so this never warned.
++    m_now = m_lastBeat = START;
++    qint64 lastRequest = 0, lastReply = 0, unanswered = 0, paused = 0, downAt = 0;
++    qint64 firstWarning = 0;
++    qint64 firstRequest = 0;
++    int samples = 0;
++    while (m_now - START < 10 * 60 * 1000) {
++        auto keeper = std::make_unique<SmsSyncKeeper>(0, lastRequest, lastReply);
++        makeKeeper(*keeper, false);
++        keeper->restoreUnanswered(unanswered, paused, downAt);
++        keeper->linkUp();
++        if (firstRequest == 0) {
++            firstRequest = keeper->unansweredSinceMs();
++        }
++        for (int step = 0; step < 4; ++step) {
++            const Sample s = appView(*keeper);
++            ++samples;
++            QVERIFY(!s.text.isEmpty());
++            if (SmsSyncStatus::isWarning(s.state)) {
++                if (firstWarning == 0) {
++                    firstWarning = s.t;
++                }
++            } else if (firstWarning != 0) {
++                QFAIL(qPrintable(QStringLiteral("warning went away at +%1 s without a reply").arg((s.t - START) / 1000)));
++            }
++            m_now += 14500;
++            keeper->checkState();
++        }
++        // The link drops: the plugin stores its clock and goes away
++        keeper->linkDown();
++        lastRequest = keeper->lastRequestMs();
++        lastReply = keeper->lastReplyMs();
++        unanswered = keeper->unansweredSinceMs();
++        paused = keeper->unansweredPausedMs();
++        downAt = keeper->linkDownAtMs();
++        QCOMPARE(unanswered, firstRequest); // never moved, never cleared
++        m_now += 2000;
++    }
++    QVERIFY(samples > 30);
++    QVERIFY2(firstWarning > 0, "a link flapping every 60 s with a silent phone never warned");
++    // About two minutes of connected silence, plus the few seconds spent disconnected
++    QVERIFY2(firstWarning - START <= SmsSyncStatus::DEFAULT_STALE_AFTER_MS + 30 * 1000, qPrintable(QString::number((firstWarning - START) / 1000)));
++}
++
++void SmsSyncStatusTest::testPhoneThatWasAwayGetsItsWindow()
++{
++    // A request was in flight when the phone left; it comes back an hour later.
++    // The hour does not count: the phone gets the rest of its window, no instant
++    // false alarm, and the clock still runs on from where it stopped.
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper first(0);
++    makeKeeper(first, false);
++    first.linkUp();
++    m_now += 30 * 1000;
++    first.checkState();
++    first.linkDown();
++    m_now += 60 * 60 * 1000;
++
++    SmsSyncKeeper second(0, first.lastRequestMs(), first.lastReplyMs());
++    makeKeeper(second, false);
++    second.restoreUnanswered(first.unansweredSinceMs(), first.unansweredPausedMs(), first.linkDownAtMs());
++    second.linkUp();
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::Waiting));
++    QCOMPARE(second.unansweredSinceMs(), first.unansweredSinceMs());
++    m_now += 80 * 1000; // 30 s + 80 s of connected silence: still inside the window
++    second.checkState();
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::Waiting));
++    m_now += 15 * 1000; // 125 s
++    second.checkState();
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::NeverAnswered));
++    QCOMPARE(int(second.state()), int(SmsSyncStatus::NeverAnswered)); // the daemon agrees
++}
++
++void SmsSyncStatusTest::testDebouncedLinkUpNeverReadsAnswered()
++{
++    // 1. A restored old answer and an unanswered request: a second link-up
++    //    inside the debounce window must not zero the clock or read as answered.
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper keeper(0, START - 60 * 60 * 1000, START - 60 * 60 * 1000);
++    makeKeeper(keeper, false);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    keeper.linkUp();
++    QCOMPARE(full.count(), 1);
++    const qint64 asked = keeper.unansweredSinceMs();
++    QVERIFY(asked > 0);
++    m_now += 3000;
++    keeper.linkUp(); // debounced: no second full request
++    QCOMPARE(full.count(), 1);
++    QCOMPARE(keeper.unansweredSinceMs(), asked);
++    QCOMPARE(appView(keeper).state, int(SmsSyncStatus::Waiting));
++    m_now += 2 * 60 * 1000;
++    keeper.checkState();
++    QCOMPARE(appView(keeper).state, int(SmsSyncStatus::NeverAnswered));
++
++    // 2. The phone answered the first request, then a new link comes up inside
++    //    the window: that link has not answered yet, and its request is sent
++    //    when the window ends, not dropped.
++    m_now = m_lastBeat = START + 24 * 60 * 60 * 1000;
++    SmsSyncKeeper second(0);
++    makeKeeper(second, true);
++    QSignalSpy secondFull(&second, &SmsSyncKeeper::wantFullSync);
++    second.linkUp();
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::Answered));
++    m_answers = false;
++    m_now += 9800;
++    second.linkUp();
++    QCOMPARE(secondFull.count(), 1);
++    QVERIFY(second.unansweredSinceMs() > 0);
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::Waiting)); // not "answered" from the older reply
++    QVERIFY(secondFull.wait(3000)); // the deferred request goes out (200 ms later)
++    QCOMPARE(secondFull.count(), 2);
++    m_now += 2 * 60 * 1000;
++    second.checkState();
++    QCOMPARE(appView(second).state, int(SmsSyncStatus::NeverAnswered));
++}
++
++void SmsSyncStatusTest::testFailedSendsCountAsNotSyncing()
++{
++    // The link is up but every packet fails to go out: nothing is "unanswered"
++    // in the old sense, yet nothing syncs. That must warn too.
++    m_now = m_lastBeat = START;
++    SmsSyncKeeper keeper(0);
++    keeper.setClock([this]() {
++        return m_now;
++    });
++    keeper.setNewestThreadProvider([]() {
++        return qint64(42);
++    });
++    connect(&keeper, &SmsSyncKeeper::wantFullSync, &keeper, &SmsSyncKeeper::noteRequestFailed);
++    connect(&keeper, &SmsSyncKeeper::wantLightSync, &keeper, &SmsSyncKeeper::noteRequestFailed);
++    keeper.linkUp();
++    QCOMPARE(keeper.unansweredSinceMs(), START); // the first failed attempt starts the clock
++    QCOMPARE(keeper.lastRequestMs(), qint64(0)); // nothing was actually asked
++    QCOMPARE(appView(keeper).state, int(SmsSyncStatus::Waiting));
++    const QList<Sample> samples = run(keeper, 10 * 60 * 1000);
++    QCOMPARE(samples.last().state, int(SmsSyncStatus::NeverAnswered));
++    QVERIFY(!samples.last().text.isEmpty());
++    QCOMPARE(keeper.unansweredSinceMs(), START); // later failures do not move it
++}
++
++QTEST_GUILESS_MAIN(SmsSyncStatusTest)
++#include "smssyncstatustest.moc"
