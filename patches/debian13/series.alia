@@ -1,0 +1,6 @@
+alia-0001-sms-keep-the-phone-sending-live-updates-and-show-whe.patch
+alia-0002-sms-shrink-images-to-fit-before-sending-off-the-main.patch
+alia-0003-sms-show-sent-messages-right-away-until-the-phone-co.patch
+alia-0004-sms-paste-images-into-the-compose-field.patch
+alia-0005-sms-preview-attachments-before-sending-with-a-remove.patch
+alia-0006-tests-drive-the-SMS-plugin-against-a-fake-device.patch
