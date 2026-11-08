@@ -1,0 +1,1550 @@
+Forwarded: not-yet
+Last-Update: 2026-11-07
+From 8b1076e89b80e6c239ef3651b823d95266410f77 Mon Sep 17 00:00:00 2001
+From: Alia Holes <thealiaholes@gmail.com>
+Date: Sat, 7 Nov 2026 21:08:20 -0800
+Subject: [PATCH 1/6] sms: keep the phone sending live updates, and show when
+ it stops
+
+The Android app only forwards new messages after the desktop has sent
+request_conversations or request_conversation during the current lifetime
+of its SMS plugin. That state is kept in memory on the phone, so after a
+reconnect, a re-pair or an app restart the desktop silently stops receiving
+messages until someone clicks Refresh in the SMS app.
+
+Ask whenever the link comes up (KdeConnectPlugin::connected), and keep it
+alive with a light heartbeat: request_conversation for the newest known
+thread with numberToRequest = 1. That sets the same flag on the phone, reads
+one message instead of every thread, and always gets exactly one reply, so
+the reply doubles as a liveness check. The heartbeat falls back to a full
+request_conversations when nothing is cached yet, when the previous request
+went unanswered, and every 30 minutes, which also catches a phone that
+still answers requests but whose live updates broke.
+
+The daemon records when it last asked, the FIRST request that is still
+unanswered (later heartbeats do not move it, only a reply clears it), when
+the phone last sent messages and when the link came up, and turns them into
+one state (smssyncstatus.h): answered, waiting, never answered on this
+connection, or stopped answering. It exposes them over D-Bus (syncStatus(),
+syncStatusChanged) and re-evaluates on a timer, because nothing arriving is
+exactly the case that has to change the state.
+
+Only a reply clears that clock. It survives reconnects (the plugin is
+recreated on every link-up, so it is kept per device for the daemon's
+lifetime): a link that drops and comes back faster than the two-minute
+window still reaches the warning. Only the time the phone was disconnected
+is left out, so a phone that was simply away gets its window back instead
+of an instant warning. A link-up inside the request debounce no longer
+reads as answered from an older reply; its request is sent when the
+debounce ends. A request that cannot even be handed to the link
+(sendPacket fails while the device is up) starts the clock too.
+
+When the phone is reachable but has not answered for two minutes, the
+daemon raises one desktop notification ("smsSyncStalled", with Retry and
+Open Messages), once per stale episode, and closes it when the phone
+answers, so a dead sync is visible with the SMS app closed. When the device
+disconnects the notification is closed as well (it would otherwise keep
+talking about a phone we no longer reach, with dead buttons); when the phone
+is back the new link decides afresh. A close that races the notification
+server's reply is repeated once.
+
+The SMS app applies the same rule: "Phone answered at HH:MM" (only that; a keep-alive
+answer does not prove every thread is current), "Asked the phone ... waiting
+for its answer", and the warnings "Not syncing: the phone has not answered
+since it connected at HH:MM" / "Not syncing: the phone last answered at
+HH:MM" with a Retry action, which stay up until a reply.
+
+Tunable per device in the plugin config: syncHeartbeatSeconds (default
+300, 0 disables), syncFullSyncMinutes (default 30, 0 = only on connect) and
+syncStaleSeconds (default 120).
+---
+ plugins/kdeconnect.notifyrc                |   6 +
+ plugins/sms/CMakeLists.txt                 |   1 +
+ plugins/sms/conversationsdbusinterface.cpp |  60 ++++++
+ plugins/sms/conversationsdbusinterface.h   |  50 +++++
+ plugins/sms/smsplugin.cpp                  | 188 ++++++++++++++++++-
+ plugins/sms/smsplugin.h                    |  22 +++
+ plugins/sms/smssynckeeper.cpp              | 206 +++++++++++++++++++++
+ plugins/sms/smssynckeeper.h                | 172 +++++++++++++++++
+ plugins/sms/smssyncstatus.h                |  69 +++++++
+ smsapp/CMakeLists.txt                      |   1 +
+ smsapp/conversationlistmodel.cpp           |  60 ++++++
+ smsapp/conversationlistmodel.h             |  28 +++
+ smsapp/qml/ConversationDisplay.qml         |  18 ++
+ smsapp/qml/ConversationList.qml            |  18 ++
+ smsapp/smshelper.cpp                       |  33 ++++
+ smsapp/smshelper.h                         |  12 ++
+ tests/CMakeLists.txt                       |   3 +
+ tests/smssynckeepertest.cpp                | 173 +++++++++++++++++
+ 18 files changed, 1118 insertions(+), 2 deletions(-)
+ create mode 100644 plugins/sms/smssynckeeper.cpp
+ create mode 100644 plugins/sms/smssynckeeper.h
+ create mode 100644 plugins/sms/smssyncstatus.h
+ create mode 100644 tests/smssynckeepertest.cpp
+
+diff --git a/plugins/kdeconnect.notifyrc b/plugins/kdeconnect.notifyrc
+index f2dbf95..e12aaee 100644
+--- a/plugins/kdeconnect.notifyrc
++++ b/plugins/kdeconnect.notifyrc
+@@ -1052,3 +1052,9 @@ Comment[zh_CN]=收到文本
+ Comment[zh_TW]=接收到簡訊
+ Action=Popup
+ Urgency=Low
++
++[Event/smsSyncStalled]
++Name=Messages Not Syncing
++Comment=The phone stopped sending text messages to this computer
++Action=Popup
++Urgency=Normal
+diff --git a/plugins/sms/CMakeLists.txt b/plugins/sms/CMakeLists.txt
+index 0f076b6..4381a9e 100644
+--- a/plugins/sms/CMakeLists.txt
++++ b/plugins/sms/CMakeLists.txt
+@@ -4,6 +4,7 @@ target_sources(kdeconnect_sms PRIVATE
+     smsplugin.cpp
+     conversationsdbusinterface.cpp
+     requestconversationworker.cpp
++    smssynckeeper.cpp
+ )
+ ecm_qt_declare_logging_category(kdeconnect_sms
+     HEADER kdeconnect_conversations_debug.h
+diff --git a/plugins/sms/conversationsdbusinterface.cpp b/plugins/sms/conversationsdbusinterface.cpp
+index 94b4e58..793b22e 100644
+--- a/plugins/sms/conversationsdbusinterface.cpp
++++ b/plugins/sms/conversationsdbusinterface.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <QDBusConnection>
+ 
++#include <limits>
++
+ #include <core/device.h>
+ #include <core/kdeconnectplugin.h>
+ 
+@@ -212,4 +214,62 @@ void ConversationsDbusInterface::attachmentDownloaded(const QString &filePath, c
+     Q_EMIT attachmentReceived(filePath, fileName);
+ }
+ 
++qint64 ConversationsDbusInterface::newestConversationId() const
++{
++    qint64 newestId = -1;
++    qint64 newestDate = std::numeric_limits<qint64>::min();
++    for (auto it = m_conversations.cbegin(); it != m_conversations.cend(); ++it) {
++        if (it.value().isEmpty()) {
++            continue;
++        }
++        const qint64 date = it.value().lastKey();
++        if (date > newestDate) {
++            newestDate = date;
++            newestId = it.key();
++        }
++    }
++    return newestId;
++}
++
++void ConversationsDbusInterface::setSyncStatus(qint64 lastRequestMs,
++                                               qint64 lastReplyMs,
++                                               qint64 unansweredSinceMs,
++                                               qint64 connectedSinceMs,
++                                               qint64 staleAfterMs,
++                                               int state,
++                                               qint64 unansweredPausedMs)
++{
++    m_lastSyncRequestMs = lastRequestMs;
++    m_lastSyncReplyMs = lastReplyMs;
++    m_syncUnansweredSinceMs = unansweredSinceMs;
++    m_syncConnectedSinceMs = connectedSinceMs;
++    m_syncStaleAfterMs = staleAfterMs;
++    m_syncUnansweredPausedMs = unansweredPausedMs;
++    m_syncState = state;
++    Q_EMIT syncStatusChanged();
++}
++
++QVariantMap ConversationsDbusInterface::syncStatus() const
++{
++    return {
++        {QStringLiteral("lastRequest"), m_lastSyncRequestMs},
++        {QStringLiteral("lastReply"), m_lastSyncReplyMs},
++        {QStringLiteral("unansweredSince"), m_syncUnansweredSinceMs},
++        {QStringLiteral("connectedSince"), m_syncConnectedSinceMs},
++        {QStringLiteral("staleAfter"), m_syncStaleAfterMs},
++        {QStringLiteral("unansweredPaused"), m_syncUnansweredPausedMs},
++        {QStringLiteral("state"), m_syncState},
++    };
++}
++
++qlonglong ConversationsDbusInterface::lastSyncRequest() const
++{
++    return m_lastSyncRequestMs;
++}
++
++qlonglong ConversationsDbusInterface::lastSyncReply() const
++{
++    return m_lastSyncReplyMs;
++}
++
+ #include "moc_conversationsdbusinterface.cpp"
+diff --git a/plugins/sms/conversationsdbusinterface.h b/plugins/sms/conversationsdbusinterface.h
+index 76f1fb5..fb37764 100644
+--- a/plugins/sms/conversationsdbusinterface.h
++++ b/plugins/sms/conversationsdbusinterface.h
+@@ -58,7 +58,43 @@ public:
+      */
+     void attachmentDownloaded(const QString &filePath, const QString &fileName);
+ 
++    /**
++     * The thread whose newest cached message is the most recent one, or -1 when nothing is cached
++     */
++    qint64 newestConversationId() const;
++
++    /**
++     * Record the sync times kept by SmsSyncKeeper (ms since epoch, 0 = never) and the
++     * SmsSyncStatus::State they evaluate to
++     */
++    void setSyncStatus(qint64 lastRequestMs,
++                       qint64 lastReplyMs,
++                       qint64 unansweredSinceMs,
++                       qint64 connectedSinceMs,
++                       qint64 staleAfterMs,
++                       int state,
++                       qint64 unansweredPausedMs = 0);
++
+ public Q_SLOTS:
++    /**
++     * When the phone was last asked for messages, in ms since epoch, 0 if never
++     */
++    qlonglong lastSyncRequest() const;
++
++    /**
++     * When the phone last sent messages, in ms since epoch, 0 if never.
++     * If this is older than lastSyncRequest() for long, the phone is not answering.
++     */
++    qlonglong lastSyncReply() const;
++
++    /**
++     * Everything the SMS app needs to say whether the phone is still sending messages:
++     * "lastRequest", "lastReply", "unansweredSince" (the first request not answered yet,
++     * 0 if none; it survives reconnects), "unansweredPaused" (disconnected time inside it,
++     * not counted), "connectedSince", "staleAfter" (all ms) and "state" (SmsSyncStatus::State)
++     */
++    QVariantMap syncStatus() const;
++
+     /**
+      * Return a list of the first message in every conversation
+      *
+@@ -133,6 +169,12 @@ Q_SIGNALS:
+      */
+     Q_SCRIPTABLE void attachmentReceived(QString filePath, QString fileName);
+ 
++    /**
++     * Emitted whenever we ask the phone for messages, the phone sends messages, or the
++     * sync state changes with time; read syncStatus() for the values
++     */
++    Q_SCRIPTABLE void syncStatusChanged();
++
+ private: // methods
+     QString newId(); // Generates successive identifiers to use as public ids
+ 
+@@ -163,6 +205,14 @@ private: // attributes
+ 
+     int m_lastId;
+ 
++    qint64 m_lastSyncRequestMs = 0;
++    qint64 m_lastSyncReplyMs = 0;
++    qint64 m_syncUnansweredSinceMs = 0;
++    qint64 m_syncConnectedSinceMs = 0;
++    qint64 m_syncStaleAfterMs = 0;
++    qint64 m_syncUnansweredPausedMs = 0;
++    int m_syncState = 0;
++
+     SmsDbusInterface m_smsInterface;
+ 
+     QSet<qint64> conversationsWaitingForMessages;
+diff --git a/plugins/sms/smsplugin.cpp b/plugins/sms/smsplugin.cpp
+index 765eca1..57b367f 100644
+--- a/plugins/sms/smsplugin.cpp
++++ b/plugins/sms/smsplugin.cpp
+@@ -8,14 +8,20 @@
+ #include "smsplugin.h"
+ 
+ #include <KLocalizedString>
++#include <KNotification>
+ #include <KPluginFactory>
+ 
+ #include <QDBusConnection>
++#include <QDateTime>
+ #include <QDebug>
+ #include <QFile>
+ #include <QFileInfo>
++#include <QHash>
++#include <QLocale>
+ #include <QMimeDatabase>
++#include <QPointer>
+ #include <QProcess>
++#include <QTimer>
+ 
+ #include <core/daemon.h>
+ #include <core/device.h>
+@@ -25,20 +31,187 @@
+ 
+ K_PLUGIN_CLASS_WITH_JSON(SmsPlugin, "kdeconnect_sms.json")
+ 
++namespace
++{
++// The plugin is destroyed whenever the device goes away; keep the sync
++// timestamps per device for the lifetime of the daemon so the UI can still
++// say how long ago the phone last answered after a reconnect. The "not
++// syncing" notification lives here too: it is raised once per stale episode
++// and must be closable by whichever plugin instance sees the phone answer.
++struct DeviceSync {
++    qint64 lastRequestMs = 0;
++    qint64 lastReplyMs = 0;
++    // The unanswered clock outlives the plugin: a reconnect does not reset it
++    qint64 unansweredSinceMs = 0;
++    qint64 unansweredPausedMs = 0;
++    qint64 linkDownAtMs = 0;
++    bool stallNotified = false;
++    QPointer<KNotification> stallNotification;
++};
++QHash<QString, DeviceSync> &syncByDevice()
++{
++    static QHash<QString, DeviceSync> sync;
++    return sync;
++}
++
++QString shortTime(qint64 ms)
++{
++    const QDateTime when = QDateTime::fromMSecsSinceEpoch(ms);
++    if (when.date() == QDate::currentDate()) {
++        return QLocale().toString(when.time(), QLocale::ShortFormat);
++    }
++    return QLocale().toString(when, QLocale::ShortFormat);
++}
++
++constexpr int DEFAULT_HEARTBEAT_SECONDS = 300;
++constexpr int DEFAULT_FULL_SYNC_MINUTES = 30;
++constexpr int DEFAULT_STALE_SECONDS = SmsSyncStatus::DEFAULT_STALE_AFTER_MS / 1000;
++}
++
+ SmsPlugin::SmsPlugin(QObject *parent, const QVariantList &args)
+     : KdeConnectPlugin(parent, args)
+     , m_conversationInterface(new ConversationsDbusInterface(this))
++    , m_deviceId(device()->id())
+ {
++    const DeviceSync restored = syncByDevice().value(m_deviceId);
++    // Seconds between keep-alive requests to the phone; 0 disables the heartbeat
++    const int heartbeatSeconds = config()->getInt(QStringLiteral("syncHeartbeatSeconds"), DEFAULT_HEARTBEAT_SECONDS);
++    m_syncKeeper = new SmsSyncKeeper(heartbeatSeconds * 1000, restored.lastRequestMs, restored.lastReplyMs, this);
++    // Minutes between full re-reads of every thread on the heartbeat; 0 = only on connect
++    m_syncKeeper->setFullSyncIntervalMs(qint64(config()->getInt(QStringLiteral("syncFullSyncMinutes"), DEFAULT_FULL_SYNC_MINUTES)) * 60 * 1000);
++    // Seconds the phone may take to answer before we say sync has stopped
++    m_syncKeeper->setStaleAfterMs(qint64(config()->getInt(QStringLiteral("syncStaleSeconds"), DEFAULT_STALE_SECONDS)) * 1000);
++    m_syncKeeper->restoreUnanswered(restored.unansweredSinceMs, restored.unansweredPausedMs, restored.linkDownAtMs);
++    m_syncKeeper->setNewestThreadProvider([this]() {
++        return m_conversationInterface->newestConversationId();
++    });
++    connect(m_syncKeeper, &SmsSyncKeeper::wantFullSync, this, &SmsPlugin::requestAllConversations);
++    connect(m_syncKeeper, &SmsSyncKeeper::wantLightSync, this, [this](qint64 threadId) {
++        requestConversation(threadId, -1, 1);
++    });
++    connect(m_syncKeeper, &SmsSyncKeeper::statusChanged, this, [this]() {
++        storeSyncStatus();
++        publishSyncStatus();
++    });
++    connect(m_syncKeeper, &SmsSyncKeeper::stateChanged, this, [this](int state) {
++        publishSyncStatus();
++        updateStallNotification(state);
++    });
++    publishSyncStatus();
+ }
+ 
+ SmsPlugin::~SmsPlugin()
+ {
++    // The plugin goes away when the device disconnects (or the plugin is
++    // disabled): remember when, so the disconnected time does not count
++    // against the phone, and keep the unanswered clock for the next link.
++    m_syncKeeper->linkDown();
++    storeSyncStatus();
++    // A persistent "not syncing" notification would go on claiming something
++    // about a phone we no longer talk to, and its actions would be dead.
++    // Close it; when the phone is back the new plugin decides afresh.
++    closeStallNotification();
+     // m_conversationInterface is self-deleting, see ~ConversationsDbusInterface for more information
+ }
+ 
++void SmsPlugin::storeSyncStatus()
++{
++    DeviceSync &sync = syncByDevice()[m_deviceId];
++    sync.lastRequestMs = m_syncKeeper->lastRequestMs();
++    sync.lastReplyMs = m_syncKeeper->lastReplyMs();
++    sync.unansweredSinceMs = m_syncKeeper->unansweredSinceMs();
++    sync.unansweredPausedMs = m_syncKeeper->unansweredPausedMs();
++    sync.linkDownAtMs = m_syncKeeper->linkDownAtMs();
++}
++
++void SmsPlugin::closeStallNotification()
++{
++    DeviceSync &sync = syncByDevice()[m_deviceId];
++    if (!sync.stallNotified) {
++        return;
++    }
++    sync.stallNotified = false;
++    if (KNotification *notification = sync.stallNotification) {
++        notification->close();
++        // A close() that lands while the notification server has not yet told
++        // KNotification its id is lost, and a "not updating" popup would stay
++        // up while messages flow again (seen when the phone answers right
++        // after a reconnect). Close once more after that round trip; the timer
++        // dies with the notification if the first close() already removed it.
++        QTimer::singleShot(1500, notification, [notification]() {
++            notification->close();
++        });
++    }
++    sync.stallNotification.clear();
++    Q_EMIT syncStallNotified(false);
++}
++
++void SmsPlugin::publishSyncStatus()
++{
++    m_conversationInterface->setSyncStatus(m_syncKeeper->lastRequestMs(),
++                                           m_syncKeeper->lastReplyMs(),
++                                           m_syncKeeper->unansweredSinceMs(),
++                                           m_syncKeeper->connectedSinceMs(),
++                                           m_syncKeeper->staleAfterMs(),
++                                           int(m_syncKeeper->state()),
++                                           m_syncKeeper->unansweredPausedMs());
++}
++
++void SmsPlugin::updateStallNotification(int state)
++{
++    DeviceSync &sync = syncByDevice()[m_deviceId];
++
++    if (state == SmsSyncStatus::Answered) {
++        // Recovered: take the warning away and allow a new one next time
++        closeStallNotification();
++        return;
++    }
++
++    // Once per stale episode: an episode only ends when the phone answers,
++    // so heartbeats and reconnects while it stays silent do not repeat it.
++    if (!SmsSyncStatus::isWarning(state) || sync.stallNotified) {
++        return;
++    }
++    sync.stallNotified = true;
++
++    QString text;
++    if (state == SmsSyncStatus::Stale) {
++        text = i18n("Text messages are not updating. The phone last answered at %1.", shortTime(m_syncKeeper->lastReplyMs()));
++    } else {
++        text = i18n("Text messages are not updating. The phone has not answered since it connected at %1.", shortTime(m_syncKeeper->connectedSinceMs()));
++    }
++    qCWarning(KDECONNECT_PLUGIN_SMS) << "SMS sync stalled for" << device()->name() << "state" << state;
++
++    auto *notification = new KNotification(QStringLiteral("smsSyncStalled"), KNotification::Persistent);
++    notification->setComponentName(QStringLiteral("kdeconnect"));
++    notification->setIconName(QStringLiteral("dialog-warning"));
++    notification->setTitle(device()->name());
++    notification->setText(text);
++    KNotificationAction *retry = notification->addAction(i18n("Retry"));
++    connect(retry, &KNotificationAction::activated, this, &SmsPlugin::requestAllConversations);
++    KNotificationAction *open = notification->addAction(i18n("Open Messages"));
++    connect(open, &KNotificationAction::activated, this, &SmsPlugin::launchApp);
++    sync.stallNotification = notification;
++    notification->sendEvent();
++    Q_EMIT syncStallNotificationCreated(notification);
++    Q_EMIT syncStallNotified(true);
++}
++
++void SmsPlugin::connected()
++{
++    // The phone only pushes new messages after it has been asked for
++    // messages since its SMS plugin was (re)created, and it does not tell us
++    // when that state is lost. Ask every time the link comes up.
++    m_syncKeeper->linkUp();
++    // The clock carries over from before a reconnect, so this link may start
++    // out in a warning; make sure the notification follows (once per episode).
++    updateStallNotification(int(m_syncKeeper->state()));
++}
++
+ void SmsPlugin::receivePacket(const NetworkPacket &np)
+ {
+     if (np.type() == PACKET_TYPE_SMS_MESSAGES) {
++        m_syncKeeper->noteReply();
+         handleBatchMessages(np);
+     }
+ 
+@@ -89,7 +262,13 @@ void SmsPlugin::requestAllConversations()
+ {
+     NetworkPacket np(PACKET_TYPE_SMS_REQUEST_CONVERSATIONS);
+ 
+-    sendPacket(np);
++    if (sendPacket(np)) {
++        m_syncKeeper->noteRequest();
++    } else {
++        // Nothing went out, so nothing will come back: counts as not syncing too
++        qCWarning(KDECONNECT_PLUGIN_SMS) << "Could not send the conversations request to" << m_deviceId;
++        m_syncKeeper->noteRequestFailed();
++    }
+ }
+ 
+ void SmsPlugin::requestConversation(const qint64 conversationID, const qint64 rangeStartTimestamp, const qint64 numberToRequest) const
+@@ -99,7 +278,12 @@ void SmsPlugin::requestConversation(const qint64 conversationID, const qint64 ra
+     np.set(QStringLiteral("rangeStartTimestamp"), rangeStartTimestamp);
+     np.set(QStringLiteral("numberToRequest"), numberToRequest);
+ 
+-    sendPacket(np);
++    if (sendPacket(np)) {
++        m_syncKeeper->noteRequest();
++    } else {
++        qCWarning(KDECONNECT_PLUGIN_SMS) << "Could not send the conversation request to" << m_deviceId;
++        m_syncKeeper->noteRequestFailed();
++    }
+ }
+ 
+ void SmsPlugin::requestAttachment(const qint64 &partID, const QString &uniqueIdentifier)
+diff --git a/plugins/sms/smsplugin.h b/plugins/sms/smsplugin.h
+index 874c4d7..0a113d7 100644
+--- a/plugins/sms/smsplugin.h
++++ b/plugins/sms/smsplugin.h
+@@ -12,6 +12,7 @@
+ #include <core/kdeconnectplugin.h>
+ 
+ #include "conversationsdbusinterface.h"
++#include "smssynckeeper.h"
+ #include "interfaces/conversationmessage.h"
+ 
+ /**
+@@ -143,6 +144,7 @@ public:
+     ~SmsPlugin() override;
+ 
+     void receivePacket(const NetworkPacket &np) override;
++    void connected() override;
+ 
+     QString dbusPath() const override;
+ 
+@@ -176,6 +178,18 @@ public Q_SLOTS:
+      */
+     Q_SCRIPTABLE void getAttachment(const qint64 &partID, const QString &uniqueIdentifier);
+ 
++Q_SIGNALS:
++    /**
++     * The "not syncing" desktop notification was raised (true) or taken away because the phone answered (false)
++     */
++    void syncStallNotified(bool shown);
++
++    /**
++     * The "not syncing" notification object was created (for tests: it deletes
++     * itself once closed)
++     */
++    void syncStallNotificationCreated(QObject *notification);
++
+ private:
+     /**
+      * Handle a packet which contains many messages, such as PACKET_TYPE_TELEPHONY_MESSAGE
+@@ -192,5 +206,13 @@ private:
+      */
+     Attachment createAttachmentFromUrl(const QString &url);
+ 
++    void publishSyncStatus();
++    void storeSyncStatus();
++    void updateStallNotification(int state);
++    void closeStallNotification();
++
+     ConversationsDbusInterface *m_conversationInterface;
++    SmsSyncKeeper *m_syncKeeper;
++    // device() may already be half destroyed when the plugin is
++    const QString m_deviceId;
+ };
+diff --git a/plugins/sms/smssynckeeper.cpp b/plugins/sms/smssynckeeper.cpp
+new file mode 100644
+index 0000000..5496ef6
+--- /dev/null
++++ b/plugins/sms/smssynckeeper.cpp
+@@ -0,0 +1,206 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "smssynckeeper.h"
++
++#include <QDateTime>
++
++namespace
++{
++int stateCheckIntervalMs(qint64 staleAfterMs)
++{
++    // Often enough that a warning shows up soon after the window ends
++    return int(qBound(qint64(250), staleAfterMs / 4, qint64(15 * 1000)));
++}
++}
++
++SmsSyncKeeper::SmsSyncKeeper(int heartbeatMs, qint64 lastRequestMs, qint64 lastReplyMs, QObject *parent)
++    : QObject(parent)
++    , m_lastRequestMs(lastRequestMs)
++    , m_lastReplyMs(lastReplyMs)
++{
++    m_heartbeat.setInterval(heartbeatMs > 0 ? heartbeatMs : 0);
++    m_heartbeat.setSingleShot(false);
++    connect(&m_heartbeat, &QTimer::timeout, this, &SmsSyncKeeper::heartbeat);
++
++    // Staleness depends on the clock, not only on packets: nothing arriving
++    // is exactly the case that must still change the state.
++    m_stateCheck.setInterval(stateCheckIntervalMs(m_staleAfterMs));
++    connect(&m_stateCheck, &QTimer::timeout, this, &SmsSyncKeeper::checkState);
++    m_stateCheck.start();
++
++    // A link-up inside the debounce window does not drop its request: it is
++    // sent when the window ends.
++    m_deferredFull.setSingleShot(true);
++    connect(&m_deferredFull, &QTimer::timeout, this, [this]() {
++        requestFull();
++        checkState();
++    });
++}
++
++void SmsSyncKeeper::setFullSyncIntervalMs(qint64 intervalMs)
++{
++    m_fullSyncIntervalMs = intervalMs;
++}
++
++void SmsSyncKeeper::setStaleAfterMs(qint64 staleAfterMs)
++{
++    m_staleAfterMs = staleAfterMs > 0 ? staleAfterMs : SmsSyncStatus::DEFAULT_STALE_AFTER_MS;
++    m_stateCheck.setInterval(stateCheckIntervalMs(m_staleAfterMs));
++    checkState();
++}
++
++void SmsSyncKeeper::setNewestThreadProvider(std::function<qint64()> provider)
++{
++    m_newestThread = std::move(provider);
++}
++
++void SmsSyncKeeper::setClock(std::function<qint64()> clock)
++{
++    m_clock = std::move(clock);
++}
++
++qint64 SmsSyncKeeper::now() const
++{
++    return m_clock ? m_clock() : QDateTime::currentMSecsSinceEpoch();
++}
++
++void SmsSyncKeeper::restoreUnanswered(qint64 unansweredSinceMs, qint64 pausedMs, qint64 linkDownAtMs)
++{
++    if (unansweredSinceMs <= 0) {
++        return;
++    }
++    m_unansweredSinceMs = unansweredSinceMs;
++    m_unansweredPausedMs = qMax(qint64(0), pausedMs);
++    m_linkDownAtMs = qMax(qint64(0), linkDownAtMs);
++    // Not evaluated here: the owner connects to stateChanged after restoring,
++    // and linkUp() evaluates (and announces) the state for the new link.
++}
++
++void SmsSyncKeeper::linkDown()
++{
++    m_heartbeat.stop();
++    m_deferredFull.stop();
++    if (m_linkDownAtMs == 0) {
++        m_linkDownAtMs = now();
++    }
++}
++
++void SmsSyncKeeper::startUnanswered()
++{
++    if (m_unansweredSinceMs == 0) {
++        m_unansweredSinceMs = now();
++        m_unansweredPausedMs = 0;
++    }
++}
++
++void SmsSyncKeeper::linkUp()
++{
++    const qint64 t = now();
++    // Whether the phone has answered on this link is judged against this
++    // time. The unanswered clock is NOT reset: only a reply clears it, so a
++    // link that drops and comes back faster than the window still warns.
++    // Only the time it spent disconnected is left out.
++    m_connectedSinceMs = t;
++    if (m_linkDownAtMs > 0) {
++        if (m_unansweredSinceMs > 0 && t > m_linkDownAtMs) {
++            m_unansweredPausedMs += t - qMax(m_linkDownAtMs, m_unansweredSinceMs);
++        }
++        m_linkDownAtMs = 0;
++    }
++
++    // A full request reads every thread on the phone, so fold bursts of
++    // link-up events (reloadPlugins runs once per link change) into one.
++    if (m_lastFullMs == 0 || t - m_lastFullMs >= FULL_REQUEST_DEBOUNCE_MS) {
++        m_deferredFull.stop();
++        requestFull();
++    } else if (m_unansweredSinceMs == 0) {
++        // Skipped, but the last full request was already answered, before this
++        // link came up: an older reply must not make this link read as
++        // answered. It owes us an answer (the clock starts now), and the
++        // request goes out when the debounce window ends instead of never.
++        startUnanswered();
++        Q_EMIT statusChanged(m_lastRequestMs, m_lastReplyMs);
++        if (!m_deferredFull.isActive()) {
++            m_deferredFull.start(int(qMax(qint64(0), m_lastFullMs + FULL_REQUEST_DEBOUNCE_MS - t)));
++        }
++    }
++    // (Skipped while the last request is still unanswered: that request is
++    // still out, and its clock keeps running.)
++    if (m_heartbeat.interval() > 0) {
++        m_heartbeat.start();
++    }
++    checkState();
++}
++
++void SmsSyncKeeper::noteRequest()
++{
++    m_lastRequestMs = now();
++    // Keep the FIRST unanswered request: later heartbeats must not restart
++    // the clock, or the warning would come and go while the phone stays silent.
++    if (m_unansweredSinceMs == 0) {
++        m_unansweredSinceMs = m_lastRequestMs;
++    }
++    Q_EMIT statusChanged(m_lastRequestMs, m_lastReplyMs);
++    checkState();
++}
++
++void SmsSyncKeeper::noteRequestFailed()
++{
++    // Nothing reached the phone, so nothing can come back: that is as much
++    // "not syncing" as a request it ignores.
++    startUnanswered();
++    Q_EMIT statusChanged(m_lastRequestMs, m_lastReplyMs);
++    checkState();
++}
++
++void SmsSyncKeeper::noteReply()
++{
++    m_lastReplyMs = now();
++    m_unansweredSinceMs = 0;
++    m_unansweredPausedMs = 0;
++    Q_EMIT statusChanged(m_lastRequestMs, m_lastReplyMs);
++    checkState();
++}
++
++void SmsSyncKeeper::checkState()
++{
++    // While the link is down the clock is paused: count up to linkDown() only
++    const qint64 at = m_linkDownAtMs > 0 ? m_linkDownAtMs : now();
++    const SmsSyncStatus::State state =
++        SmsSyncStatus::evaluate(at, m_unansweredSinceMs, m_lastReplyMs, m_connectedSinceMs, m_staleAfterMs, m_unansweredPausedMs);
++    if (state != m_state) {
++        m_state = state;
++        Q_EMIT stateChanged(int(state));
++    }
++}
++
++void SmsSyncKeeper::requestFull()
++{
++    m_lastFullMs = now();
++    Q_EMIT wantFullSync();
++}
++
++void SmsSyncKeeper::heartbeat()
++{
++    // A request is still unanswered: the phone side may have been recreated,
++    // ask for everything again instead of just one thread.
++    const bool unanswered = m_unansweredSinceMs > 0;
++    const qint64 newest = m_newestThread ? m_newestThread() : -1;
++    const bool fullDue = m_fullSyncIntervalMs > 0 && now() - m_lastFullMs >= m_fullSyncIntervalMs;
++
++    if (unanswered || newest < 0 || fullDue) {
++        requestFull();
++    } else {
++        // request_conversation sets the same "messages requested" flag on the
++        // phone as request_conversations, but reads one thread, one message,
++        // and always gets exactly one reply packet back.
++        Q_EMIT wantLightSync(newest);
++    }
++    checkState();
++}
++
++#include "moc_smssynckeeper.cpp"
+diff --git a/plugins/sms/smssynckeeper.h b/plugins/sms/smssynckeeper.h
+new file mode 100644
+index 0000000..4363e48
+--- /dev/null
++++ b/plugins/sms/smssynckeeper.h
+@@ -0,0 +1,172 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QObject>
++#include <QTimer>
++
++#include <functional>
++
++#include "smssyncstatus.h"
++
++/**
++ * Keeps the phone's SMS plugin pushing live updates.
++ *
++ * The Android app only forwards new messages after it has received a
++ * request_conversations or request_conversation packet during the current
++ * lifetime of its SMS plugin. That flag lives in memory on the phone, so a
++ * reconnect, a phone-side plugin restart or an app update silently stops
++ * all live updates until the desktop asks again.
++ *
++ * This class decides when to ask:
++ *  - a full request (request_conversations) whenever the link comes up,
++ *  - a light request (request_conversation for the newest known thread,
++ *    one message) on a heartbeat,
++ *  - a full request on the heartbeat instead when no thread is known yet,
++ *    when the previous request went unanswered, or when the last full
++ *    request is older than the full-sync interval (this catches a phone that
++ *    still answers requests but whose live updates broke).
++ *
++ * It also records when we last asked, the first request that is still
++ * unanswered, and when the phone last answered, and turns them into an
++ * SmsSyncStatus::State, so the UI and the desktop notification can show that
++ * sync has stopped instead of staying silent. Only a reply from the phone
++ * clears the unanswered clock: not a reconnect, not a skipped request, and a
++ * request that could not be sent starts it like one that went unanswered.
++ */
++class SmsSyncKeeper : public QObject
++{
++    Q_OBJECT
++
++public:
++    /**
++     * @param heartbeatMs interval of the light heartbeat; <= 0 disables the heartbeat
++     * @param lastRequestMs, lastReplyMs restored state (ms since epoch, 0 = never)
++     */
++    explicit SmsSyncKeeper(int heartbeatMs, qint64 lastRequestMs = 0, qint64 lastReplyMs = 0, QObject *parent = nullptr);
++
++    /** On the heartbeat, ask for everything again when the last full request is older than this; <= 0 = never */
++    void setFullSyncIntervalMs(qint64 intervalMs);
++
++    /** How long the phone may take to answer before the state turns into a warning */
++    void setStaleAfterMs(qint64 staleAfterMs);
++
++    /** Returns the newest known thread ID, or a negative value when none is known */
++    void setNewestThreadProvider(std::function<qint64()> provider);
++
++    /** Replace the wall clock (ms since epoch); for tests */
++    void setClock(std::function<qint64()> clock);
++
++    /**
++     * Carry the unanswered clock over from the previous plugin instance (the
++     * plugin is recreated on every reconnect).
++     * @param unansweredSinceMs the first unanswered request, 0 = none
++     * @param pausedMs disconnected time already excluded from it
++     * @param linkDownAtMs when the previous link went down, 0 = unknown; the time
++     *        until the next linkUp() is excluded too
++     */
++    void restoreUnanswered(qint64 unansweredSinceMs, qint64 pausedMs, qint64 linkDownAtMs);
++
++    /** The link to the phone is (again) usable */
++    void linkUp();
++
++    /** The link to the phone went away; time until the next linkUp() does not count as unanswered */
++    void linkDown();
++
++    /** A request was sent to the phone (by us or by anybody else) */
++    void noteRequest();
++
++    /** A request (or message) could not be handed to the link at all: counts as unanswered from now on */
++    void noteRequestFailed();
++
++    /** A packet with messages arrived from the phone */
++    void noteReply();
++
++    /** What the heartbeat timer runs; public so tests can drive it with a fake clock */
++    void heartbeat();
++
++    /** Re-evaluate the state against the clock; runs on its own timer while the link is up */
++    void checkState();
++
++    qint64 lastRequestMs() const
++    {
++        return m_lastRequestMs;
++    }
++    qint64 lastReplyMs() const
++    {
++        return m_lastReplyMs;
++    }
++    /** The first request that is still unanswered, 0 when every request was answered */
++    qint64 unansweredSinceMs() const
++    {
++        return m_unansweredSinceMs;
++    }
++    /** When linkUp() last ran, 0 before the first link */
++    qint64 connectedSinceMs() const
++    {
++        return m_connectedSinceMs;
++    }
++    /** Disconnected time inside the current unanswered stretch (not counted against the phone) */
++    qint64 unansweredPausedMs() const
++    {
++        return m_unansweredPausedMs;
++    }
++    /** When linkDown() ran, 0 while the link is up */
++    qint64 linkDownAtMs() const
++    {
++        return m_linkDownAtMs;
++    }
++    /** The keeper's clock (the wall clock unless a test replaced it) */
++    qint64 nowMs() const
++    {
++        return now();
++    }
++    qint64 staleAfterMs() const
++    {
++        return m_staleAfterMs;
++    }
++    SmsSyncStatus::State state() const
++    {
++        return m_state;
++    }
++    int heartbeatMs() const
++    {
++        return m_heartbeat.interval();
++    }
++
++    /** Requests sent less than this long after a full request are folded into it */
++    static constexpr qint64 FULL_REQUEST_DEBOUNCE_MS = 10 * 1000;
++
++Q_SIGNALS:
++    void wantFullSync();
++    void wantLightSync(qint64 threadId);
++    /** Any of the recorded times changed */
++    void statusChanged(qint64 lastRequestMs, qint64 lastReplyMs);
++    /** The evaluated state changed (an SmsSyncStatus::State) */
++    void stateChanged(int state);
++
++private:
++    void requestFull();
++    void startUnanswered();
++    qint64 now() const;
++
++    QTimer m_heartbeat;
++    QTimer m_stateCheck;
++    QTimer m_deferredFull;
++    std::function<qint64()> m_newestThread;
++    std::function<qint64()> m_clock;
++    qint64 m_lastRequestMs;
++    qint64 m_lastReplyMs;
++    qint64 m_unansweredSinceMs = 0;
++    qint64 m_connectedSinceMs = 0;
++    qint64 m_unansweredPausedMs = 0;
++    qint64 m_linkDownAtMs = 0;
++    qint64 m_lastFullMs = 0;
++    qint64 m_fullSyncIntervalMs = 0;
++    qint64 m_staleAfterMs = SmsSyncStatus::DEFAULT_STALE_AFTER_MS;
++    SmsSyncStatus::State m_state = SmsSyncStatus::Unknown;
++};
+diff --git a/plugins/sms/smssyncstatus.h b/plugins/sms/smssyncstatus.h
+new file mode 100644
+index 0000000..e589754
+--- /dev/null
++++ b/plugins/sms/smssyncstatus.h
+@@ -0,0 +1,69 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QtGlobal>
++
++/**
++ * One rule for "is the phone still sending us messages?", shared by the
++ * daemon (which raises a desktop notification) and the SMS app (which shows
++ * the status line), so both always agree.
++ *
++ * The inputs are the times SmsSyncKeeper records (ms since epoch, 0 = never):
++ *  - unansweredSinceMs: the FIRST request the phone has not answered yet.
++ *    Later unanswered requests do not move it; only a reply clears it. A
++ *    request that could not even be sent starts it too. It survives
++ *    reconnects: a link that drops and comes back while the phone stays
++ *    silent keeps the same clock, so fast flapping still warns.
++ *  - lastReplyMs: when the phone last sent any messages packet.
++ *  - connectedSinceMs: when the current link to the phone came up (for the
++ *    wording, and to tell an answer on this link from an older one).
++ *  - unansweredPausedMs: time the phone spent disconnected while a request
++ *    was unanswered; it does not count, so a phone that was simply away
++ *    gets its window when it comes back instead of an instant warning.
++ */
++namespace SmsSyncStatus
++{
++enum State {
++    /** Nothing asked and nothing heard yet */
++    Unknown = 0,
++    /** The phone answered, and no request is overdue */
++    Answered = 1,
++    /** Asked since this connection came up, no answer yet, still inside the window */
++    Waiting = 2,
++    /** The phone has not answered anything since this connection came up, past the window */
++    NeverAnswered = 3,
++    /** The phone answered earlier on this connection, then stopped answering, past the window */
++    Stale = 4,
++};
++
++/** How long the phone may take to answer before sync counts as stopped */
++constexpr qint64 DEFAULT_STALE_AFTER_MS = 2 * 60 * 1000;
++
++inline State evaluate(qint64 nowMs,
++                      qint64 unansweredSinceMs,
++                      qint64 lastReplyMs,
++                      qint64 connectedSinceMs,
++                      qint64 staleAfterMs = DEFAULT_STALE_AFTER_MS,
++                      qint64 unansweredPausedMs = 0)
++{
++    const bool answeredThisLink = lastReplyMs > 0 && lastReplyMs >= connectedSinceMs;
++    if (unansweredSinceMs <= 0) {
++        return lastReplyMs > 0 ? Answered : Unknown;
++    }
++    if (nowMs - unansweredSinceMs - qMax(qint64(0), unansweredPausedMs) < staleAfterMs) {
++        return answeredThisLink ? Answered : Waiting;
++    }
++    return answeredThisLink ? Stale : NeverAnswered;
++}
++
++/** States in which the user must be told that messages are not arriving */
++inline bool isWarning(int state)
++{
++    return state == NeverAnswered || state == Stale;
++}
++}
+diff --git a/smsapp/CMakeLists.txt b/smsapp/CMakeLists.txt
+index 078d9db..f853fed 100644
+--- a/smsapp/CMakeLists.txt
++++ b/smsapp/CMakeLists.txt
+@@ -28,6 +28,7 @@ target_link_libraries(kdeconnectsmshelper
+     Qt::DBus
+     KF6::People
+     Qt::Qml
++    KF6::I18n
+     kdeconnectinterfaces
+ )
+ 
+diff --git a/smsapp/conversationlistmodel.cpp b/smsapp/conversationlistmodel.cpp
+index 460306b..143bb74 100644
+--- a/smsapp/conversationlistmodel.cpp
++++ b/smsapp/conversationlistmodel.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "conversationlistmodel.h"
+ 
++#include <QDateTime>
++#include <QLocale>
+ #include <QPainter>
+ #include <QString>
+ 
+@@ -15,6 +17,7 @@
+ #include "dbushelpers.h"
+ #include "interfaces/conversationmessage.h"
+ #include "interfaces/dbusinterfaces.h"
++#include "plugins/sms/smssyncstatus.h"
+ #include "sms_conversations_list_debug.h"
+ #include "smshelper.h"
+ 
+@@ -38,6 +41,11 @@ ConversationListModel::ConversationListModel(QObject *parent)
+     setItemRoleNames(roles);
+ 
+     ConversationMessage::registerDbusType();
++
++    // Staleness depends on the clock, not only on new data: re-check regularly
++    m_syncStatusTimer.setInterval(15 * 1000);
++    connect(&m_syncStatusTimer, &QTimer::timeout, this, &ConversationListModel::updateSyncStatusText);
++    m_syncStatusTimer.start();
+ }
+ 
+ ConversationListModel::~ConversationListModel()
+@@ -59,8 +67,10 @@ void ConversationListModel::setDeviceId(const QString &deviceId)
+     if (m_conversationsInterface) {
+         disconnect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationCreated, this, &ConversationListModel::handleCreatedConversation);
+         disconnect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationUpdated, this, &ConversationListModel::handleConversationUpdated);
++        disconnect(m_conversationsInterface, &DeviceConversationsDbusInterface::syncStatusChanged, this, &ConversationListModel::fetchSyncStatus);
+         delete m_conversationsInterface;
+         m_conversationsInterface = nullptr;
++        handleSyncStatus(QVariantMap());
+     }
+ 
+     // This method still gets called *with a valid deviceID* when the device is not connected while the component is setting up
+@@ -76,10 +86,60 @@ void ConversationListModel::setDeviceId(const QString &deviceId)
+     m_conversationsInterface = new DeviceConversationsDbusInterface(deviceId, this);
+     connect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationCreated, this, &ConversationListModel::handleCreatedConversation);
+     connect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationUpdated, this, &ConversationListModel::handleConversationUpdated);
++    connect(m_conversationsInterface, &DeviceConversationsDbusInterface::syncStatusChanged, this, &ConversationListModel::fetchSyncStatus);
++    fetchSyncStatus();
+ 
+     refresh();
+ }
+ 
++void ConversationListModel::fetchSyncStatus()
++{
++    if (!m_conversationsInterface) {
++        return;
++    }
++    // An older daemon does not have this method; the reply then carries an error and we show nothing
++    const QDBusPendingReply<QVariantMap> reply = m_conversationsInterface->syncStatus();
++    setWhenAvailable(
++        reply,
++        [this](bool error, const QVariantMap &status) {
++            if (!error) {
++                handleSyncStatus(status);
++            }
++        },
++        this);
++}
++
++void ConversationListModel::handleSyncStatus(const QVariantMap &status)
++{
++    m_lastSyncReplyMs = status.value(QStringLiteral("lastReply")).toLongLong();
++    m_syncUnansweredSinceMs = status.value(QStringLiteral("unansweredSince")).toLongLong();
++    m_syncConnectedSinceMs = status.value(QStringLiteral("connectedSince")).toLongLong();
++    m_syncStaleAfterMs = status.value(QStringLiteral("staleAfter")).toLongLong();
++    m_syncUnansweredPausedMs = status.value(QStringLiteral("unansweredPaused")).toLongLong();
++    updateSyncStatusText();
++}
++
++void ConversationListModel::updateSyncStatusText()
++{
++    // The same rule the daemon uses for its notification, re-evaluated here on
++    // our own timer so the line turns into a warning even if nothing arrives.
++    const qint64 staleAfter = m_syncStaleAfterMs > 0 ? m_syncStaleAfterMs : SmsSyncStatus::DEFAULT_STALE_AFTER_MS;
++    const int state = SmsSyncStatus::evaluate(QDateTime::currentMSecsSinceEpoch(),
++                                              m_syncUnansweredSinceMs,
++                                              m_lastSyncReplyMs,
++                                              m_syncConnectedSinceMs,
++                                              staleAfter,
++                                              m_syncUnansweredPausedMs);
++    const bool stale = SmsSyncStatus::isWarning(state);
++    const QString text = SmsHelper::syncStatusText(state, m_lastSyncReplyMs, m_syncUnansweredSinceMs, m_syncConnectedSinceMs);
++
++    if (text != m_syncStatusText || stale != m_syncStale) {
++        m_syncStatusText = text;
++        m_syncStale = stale;
++        Q_EMIT syncStatusChanged();
++    }
++}
++
+ void ConversationListModel::refresh()
+ {
+     if (m_deviceId.isEmpty()) {
+diff --git a/smsapp/conversationlistmodel.h b/smsapp/conversationlistmodel.h
+index 9746a6a..8bdadf8 100644
+--- a/smsapp/conversationlistmodel.h
++++ b/smsapp/conversationlistmodel.h
+@@ -9,6 +9,7 @@
+ #define CONVERSATIONLISTMODEL_H
+ 
+ #include <QStandardItemModel>
++#include <QTimer>
+ 
+ #include "interfaces/conversationmessage.h"
+ #include "interfaces/dbusinterfaces.h"
+@@ -17,6 +18,10 @@ class ConversationListModel : public QStandardItemModel
+ {
+     Q_OBJECT
+     Q_PROPERTY(QString deviceId READ deviceId WRITE setDeviceId NOTIFY deviceIdChanged)
++    /** "Phone answered at …", "waiting", or a warning when the phone stopped answering; empty when unknown */
++    Q_PROPERTY(QString syncStatusText READ syncStatusText NOTIFY syncStatusChanged)
++    /** True from the moment the first unanswered request is overdue until the phone answers */
++    Q_PROPERTY(bool syncStale READ syncStale NOTIFY syncStatusChanged)
+ 
+ public:
+     ConversationListModel(QObject *parent = nullptr);
+@@ -43,6 +48,15 @@ public:
+ 
+     Q_SCRIPTABLE void refresh();
+ 
++    QString syncStatusText() const
++    {
++        return m_syncStatusText;
++    }
++    bool syncStale() const
++    {
++        return m_syncStale;
++    }
++
+     /**
+      * This method creates conversation with an arbitrary address
+      */
+@@ -57,6 +71,7 @@ public Q_SLOTS:
+ 
+ Q_SIGNALS:
+     void deviceIdChanged();
++    void syncStatusChanged();
+ 
+ private:
+     /**
+@@ -67,8 +82,21 @@ private:
+     QStandardItem *conversationForThreadId(qint32 threadId);
+     QStandardItem *getConversationForAddress(const QString &address);
+ 
++    void fetchSyncStatus();
++    void handleSyncStatus(const QVariantMap &status);
++    void updateSyncStatusText();
++
+     DeviceConversationsDbusInterface *m_conversationsInterface;
+     QString m_deviceId;
++
++    qint64 m_lastSyncReplyMs = 0;
++    qint64 m_syncUnansweredSinceMs = 0;
++    qint64 m_syncConnectedSinceMs = 0;
++    qint64 m_syncStaleAfterMs = 0;
++    qint64 m_syncUnansweredPausedMs = 0;
++    QString m_syncStatusText;
++    bool m_syncStale = false;
++    QTimer m_syncStatusTimer;
+ };
+ 
+ #endif // CONVERSATIONLISTMODEL_H
+diff --git a/smsapp/qml/ConversationDisplay.qml b/smsapp/qml/ConversationDisplay.qml
+index e213ab5..65aecd3 100644
+--- a/smsapp/qml/ConversationDisplay.qml
++++ b/smsapp/qml/ConversationDisplay.qml
+@@ -25,6 +25,10 @@ Kirigami.ScrollablePage
+ 
+     property bool isInitalized: false
+ 
++    // From the conversation list: the phone stopped answering
++    property bool syncStale: false
++    property string syncStatusText
++
+     property var conversationModel: ConversationModel {
+         deviceId: AppData.deviceId
+         threadId: page.conversationId
+@@ -35,6 +39,20 @@ Kirigami.ScrollablePage
+         }
+     }
+ 
++    header: Kirigami.InlineMessage {
++        visible: page.deviceConnected && page.syncStale
++        type: Kirigami.MessageType.Warning
++        text: page.syncStatusText
++
++        actions: [
++            Kirigami.Action {
++                icon.name: "view-refresh"
++                text: i18nd("kdeconnect-sms", "Retry")
++                onTriggered: applicationWindow().pageStack.initialPage.conversationListModel.refresh()
++            }
++        ]
++    }
++
+     property var addresses
+     title: SmsHelper.getTitleForAddresses(addresses)
+ 
+diff --git a/smsapp/qml/ConversationList.qml b/smsapp/qml/ConversationList.qml
+index 1672b6b..3398289 100644
+--- a/smsapp/qml/ConversationList.qml
++++ b/smsapp/qml/ConversationList.qml
+@@ -90,6 +90,22 @@ Kirigami.ScrollablePage
+         ]
+     }
+ 
++    // Never let a stalled sync look like "no new messages"
++    footer: Kirigami.InlineMessage {
++        visible: deviceConnected && conversationListModel.syncStatusText.length > 0
++        type: conversationListModel.syncStale ? Kirigami.MessageType.Warning : Kirigami.MessageType.Information
++        text: conversationListModel.syncStatusText
++
++        actions: [
++            Kirigami.Action {
++                icon.name: "view-refresh"
++                text: i18nd("kdeconnect-sms", "Retry")
++                visible: conversationListModel.syncStale
++                onTriggered: conversationListModel.refresh()
++            }
++        ]
++    }
++
+     titleDelegate: RowLayout {
+         spacing: Kirigami.Units.mediumSpacing
+ 
+@@ -163,6 +179,8 @@ Kirigami.ScrollablePage
+         id: chatView
+         ConversationDisplay {
+             deviceConnected: page.deviceConnected
++            syncStale: conversationListModel.syncStale
++            syncStatusText: conversationListModel.syncStatusText
+         }
+     }
+ 
+diff --git a/smsapp/smshelper.cpp b/smsapp/smshelper.cpp
+index a02c2ed..f01cbed 100644
+--- a/smsapp/smshelper.cpp
++++ b/smsapp/smshelper.cpp
+@@ -23,13 +23,46 @@
+ #include <KPeople/PersonsModel>
+ 
+ #include "interfaces/conversationmessage.h"
++#include "plugins/sms/smssyncstatus.h"
+ #include "smsapp/gsmasciimap.h"
+ 
++#include <KLocalizedString>
++#include <QDateTime>
++#include <QLocale>
++
+ QObject *SmsHelper::singletonProvider(QQmlEngine * /*engine*/, QJSEngine * /*scriptEngine*/)
+ {
+     return new SmsHelper();
+ }
+ 
++QString SmsHelper::shortTime(qint64 msSinceEpoch)
++{
++    const QDateTime when = QDateTime::fromMSecsSinceEpoch(msSinceEpoch);
++    if (when.date() == QDate::currentDate()) {
++        return QLocale().toString(when.time(), QLocale::ShortFormat);
++    }
++    return QLocale().toString(when, QLocale::ShortFormat);
++}
++
++QString SmsHelper::syncStatusText(int state, qint64 lastReplyMs, qint64 unansweredSinceMs, qint64 connectedSinceMs)
++{
++    switch (state) {
++    case SmsSyncStatus::Answered:
++        // Only that the phone answered: a keep-alive answer does not prove every thread is current
++        return i18nd("kdeconnect-sms", "Phone answered at %1", shortTime(lastReplyMs));
++    case SmsSyncStatus::Waiting:
++        return i18nd("kdeconnect-sms", "Asked the phone for messages at %1, waiting for its answer", shortTime(unansweredSinceMs));
++    case SmsSyncStatus::NeverAnswered:
++        return i18nd("kdeconnect-sms",
++                     "Not syncing: the phone has not answered since it connected at %1",
++                     shortTime(connectedSinceMs > 0 ? connectedSinceMs : unansweredSinceMs));
++    case SmsSyncStatus::Stale:
++        return i18nd("kdeconnect-sms", "Not syncing: the phone last answered at %1", shortTime(lastReplyMs));
++    default:
++        return QString();
++    }
++}
++
+ bool SmsHelper::isPhoneNumberMatchCanonicalized(const QString &canonicalPhone1, const QString &canonicalPhone2)
+ {
+     if (canonicalPhone1.isEmpty() || canonicalPhone2.isEmpty()) {
+diff --git a/smsapp/smshelper.h b/smsapp/smshelper.h
+index 8dccc3d..df0ae17 100644
+--- a/smsapp/smshelper.h
++++ b/smsapp/smshelper.h
+@@ -26,6 +26,18 @@ class SmsHelper : public QObject
+ public:
+     static QObject *singletonProvider(QQmlEngine *engine, QJSEngine *scriptEngine);
+ 
++    /**
++     * The status line for SMS sync, from what the daemon reports (see plugins/sms/smssyncstatus.h).
++     * Says what the time means: when the phone last answered, or since when it has not.
++     * Empty only for SmsSyncStatus::Unknown (nothing asked, nothing heard).
++     */
++    static QString syncStatusText(int state, qint64 lastReplyMs, qint64 unansweredSinceMs, qint64 connectedSinceMs);
++
++    /**
++     * A time as HH:MM when it is today, with the date otherwise
++     */
++    static QString shortTime(qint64 msSinceEpoch);
++
+     enum CountryCode {
+         Australia,
+         CzechRepublic,
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 69e1955..d81dcda 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -17,6 +17,9 @@ set(kdeconnect_libraries
+ ecm_add_test(pluginloadtest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ ecm_add_test(sendfiletest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ ecm_add_test(smshelpertest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
++ecm_add_test(smssynckeepertest.cpp ${PROJECT_SOURCE_DIR}/plugins/sms/smssynckeeper.cpp
++    TEST_NAME smssynckeepertest
++    LINK_LIBRARIES ${kdeconnect_libraries})
+ 
+ if(MDNS_ENABLED)
+     ecm_add_test(mdnstest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+diff --git a/tests/smssynckeepertest.cpp b/tests/smssynckeepertest.cpp
+new file mode 100644
+index 0000000..8860d51
+--- /dev/null
++++ b/tests/smssynckeepertest.cpp
+@@ -0,0 +1,173 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Alia Holes <thealiaholes@gmail.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "plugins/sms/smssynckeeper.h"
++
++#include <QSignalSpy>
++#include <QTest>
++
++/**
++ * The phone stops pushing new messages after any reconnect until it is asked
++ * again. These tests drive SmsSyncKeeper the way SmsPlugin does: linkUp() from
++ * KdeConnectPlugin::connected(), noteRequest() when a request packet went out,
++ * noteReply() when a kdeconnect.sms.messages packet came in.
++ */
++class SmsSyncKeeperTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testFullRequestOnLinkUp();
++    void testReconnectAsksAgain();
++    void testBurstOfLinkUpsIsOneRequest();
++    void testHeartbeatIsLightWhenAnswered();
++    void testHeartbeatFallsBackToFullWhenUnanswered();
++    void testHeartbeatFullWhenNoThreadKnown();
++    void testHeartbeatDisabled();
++    void testPeriodicFullSync();
++    void testStatusSignal();
++};
++
++// Simulates the plugin: answers every request like a healthy phone would
++static void wireHealthyPhone(SmsSyncKeeper &keeper)
++{
++    QObject::connect(&keeper, &SmsSyncKeeper::wantFullSync, &keeper, [&keeper]() {
++        keeper.noteRequest();
++        keeper.noteReply();
++    });
++    QObject::connect(&keeper, &SmsSyncKeeper::wantLightSync, &keeper, [&keeper](qint64) {
++        keeper.noteRequest();
++        keeper.noteReply();
++    });
++}
++
++void SmsSyncKeeperTest::testFullRequestOnLinkUp()
++{
++    SmsSyncKeeper keeper(60 * 1000);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    keeper.linkUp();
++    QCOMPARE(full.count(), 1);
++}
++
++void SmsSyncKeeperTest::testReconnectAsksAgain()
++{
++    // The plugin is recreated on every reconnect: a new keeper, restored times
++    SmsSyncKeeper first(60 * 1000);
++    QSignalSpy firstFull(&first, &SmsSyncKeeper::wantFullSync);
++    first.linkUp();
++    QCOMPARE(firstFull.count(), 1);
++
++    SmsSyncKeeper second(60 * 1000, first.lastRequestMs(), first.lastReplyMs());
++    QSignalSpy secondFull(&second, &SmsSyncKeeper::wantFullSync);
++    second.linkUp();
++    QCOMPARE(secondFull.count(), 1);
++}
++
++void SmsSyncKeeperTest::testBurstOfLinkUpsIsOneRequest()
++{
++    SmsSyncKeeper keeper(60 * 1000);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    keeper.linkUp();
++    keeper.linkUp();
++    keeper.linkUp();
++    QCOMPARE(full.count(), 1);
++}
++
++void SmsSyncKeeperTest::testHeartbeatIsLightWhenAnswered()
++{
++    SmsSyncKeeper keeper(100);
++    keeper.setNewestThreadProvider([]() {
++        return qint64(1234);
++    });
++    wireHealthyPhone(keeper);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    QSignalSpy light(&keeper, &SmsSyncKeeper::wantLightSync);
++
++    keeper.linkUp();
++    QCOMPARE(full.count(), 1);
++    QVERIFY(light.wait(1000));
++    QCOMPARE(light.first().first().toLongLong(), qint64(1234));
++    QCOMPARE(full.count(), 1); // the heartbeat did not re-read every thread
++    QVERIFY(light.wait(1000)); // and it keeps beating
++}
++
++void SmsSyncKeeperTest::testHeartbeatFallsBackToFullWhenUnanswered()
++{
++    SmsSyncKeeper keeper(100);
++    keeper.setNewestThreadProvider([]() {
++        return qint64(1234);
++    });
++    // A phone that never answers: requests go out, no reply comes back
++    connect(&keeper, &SmsSyncKeeper::wantFullSync, &keeper, &SmsSyncKeeper::noteRequest);
++    connect(&keeper, &SmsSyncKeeper::wantLightSync, &keeper, &SmsSyncKeeper::noteRequest);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    QSignalSpy light(&keeper, &SmsSyncKeeper::wantLightSync);
++
++    keeper.linkUp();
++    QVERIFY(full.wait(1000)); // the next heartbeat asks for everything again
++    QCOMPARE(full.count(), 2);
++    QCOMPARE(light.count(), 0);
++    QVERIFY(keeper.lastReplyMs() < keeper.lastRequestMs());
++}
++
++void SmsSyncKeeperTest::testHeartbeatFullWhenNoThreadKnown()
++{
++    SmsSyncKeeper keeper(100);
++    keeper.setNewestThreadProvider([]() {
++        return qint64(-1);
++    });
++    wireHealthyPhone(keeper);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    QSignalSpy light(&keeper, &SmsSyncKeeper::wantLightSync);
++    keeper.linkUp();
++    QVERIFY(full.wait(1000));
++    QCOMPARE(light.count(), 0);
++}
++
++void SmsSyncKeeperTest::testHeartbeatDisabled()
++{
++    SmsSyncKeeper keeper(0);
++    wireHealthyPhone(keeper);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    QSignalSpy light(&keeper, &SmsSyncKeeper::wantLightSync);
++    keeper.linkUp();
++    QCOMPARE(full.count(), 1); // still asks on connect
++    QTest::qWait(300);
++    QCOMPARE(full.count(), 1);
++    QCOMPARE(light.count(), 0);
++}
++
++void SmsSyncKeeperTest::testPeriodicFullSync()
++{
++    SmsSyncKeeper keeper(100);
++    keeper.setFullSyncIntervalMs(350);
++    keeper.setNewestThreadProvider([]() {
++        return qint64(1234);
++    });
++    wireHealthyPhone(keeper);
++    QSignalSpy full(&keeper, &SmsSyncKeeper::wantFullSync);
++    QSignalSpy light(&keeper, &SmsSyncKeeper::wantLightSync);
++    keeper.linkUp();
++    QCOMPARE(full.count(), 1);
++    QVERIFY(full.wait(1500)); // a full re-read comes back around even though every request was answered
++    QVERIFY(light.count() >= 2); // and light beats in between
++}
++
++void SmsSyncKeeperTest::testStatusSignal()
++{
++    SmsSyncKeeper keeper(0);
++    QSignalSpy status(&keeper, &SmsSyncKeeper::statusChanged);
++    keeper.noteRequest();
++    QCOMPARE(status.count(), 1);
++    QVERIFY(status.last().at(0).toLongLong() > 0);
++    QCOMPARE(status.last().at(1).toLongLong(), qint64(0));
++    keeper.noteReply();
++    QCOMPARE(status.count(), 2);
++    QVERIFY(status.last().at(1).toLongLong() >= status.last().at(0).toLongLong());
++}
++
++QTEST_GUILESS_MAIN(SmsSyncKeeperTest)
++#include "smssynckeepertest.moc"
+-- 
+2.43.0
+
