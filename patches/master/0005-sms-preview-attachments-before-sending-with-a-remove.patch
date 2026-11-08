@@ -1,0 +1,114 @@
+From 0683f9887eeacd59b41ed00e8b5f51b0ae7778dd Mon Sep 17 00:00:00 2001
+From: Alia Holes <thealiaholes@gmail.com>
+Date: Sat, 7 Nov 2026 21:12:43 -0800
+Subject: [PATCH 5/6] sms: preview attachments before sending, with a remove
+ button each
+
+Replace the bare red attachment counter with a strip of thumbnails above the
+compose field. Images are decoded asynchronously at thumbnail size; other
+files show an icon and their name. Each one has its own remove button; the
+existing button still clears them all.
+---
+ smsapp/qml/SendingArea.qml | 82 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/smsapp/qml/SendingArea.qml b/smsapp/qml/SendingArea.qml
+index ea5869d..0fbce0e 100644
+--- a/smsapp/qml/SendingArea.qml
++++ b/smsapp/qml/SendingArea.qml
+@@ -88,6 +88,82 @@ ColumnLayout {
+         visible: false
+     }
+ 
++    function removeAttachment(index) {
++        const remaining = Array.from(root.selectedFileUrls)
++        remaining.splice(index, 1)
++        root.selectedFileUrls = remaining
++    }
++
++    Flow {
++        id: attachmentStrip
++        visible: root.selectedFileUrls.length > 0
++        Layout.fillWidth: true
++        Layout.leftMargin: Kirigami.Units.largeSpacing
++        Layout.rightMargin: Kirigami.Units.largeSpacing
++        Layout.topMargin: Kirigami.Units.smallSpacing
++        spacing: Kirigami.Units.smallSpacing
++
++        Repeater {
++            model: root.selectedFileUrls
++
++            delegate: Rectangle {
++                id: attachmentThumb
++                required property var modelData
++                required property int index
++
++                width: Kirigami.Units.gridUnit * 4
++                height: width
++                radius: Kirigami.Units.cornerRadius
++                color: Kirigami.Theme.alternateBackgroundColor
++                clip: true
++
++                Image {
++                    id: preview
++                    anchors.fill: parent
++                    source: attachmentThumb.modelData
++                    // Decode a small version off the GUI thread, big photos must not freeze the window
++                    sourceSize.width: attachmentThumb.width * 2
++                    sourceSize.height: attachmentThumb.height * 2
++                    asynchronous: true
++                    fillMode: Image.PreserveAspectCrop
++                    visible: status === Image.Ready
++                }
++
++                ColumnLayout {
++                    anchors.fill: parent
++                    anchors.margins: Kirigami.Units.smallSpacing
++                    visible: preview.status !== Image.Ready
++
++                    Kirigami.Icon {
++                        source: "mail-attachment-symbolic"
++                        Layout.alignment: Qt.AlignHCenter
++                        Layout.preferredWidth: Kirigami.Units.gridUnit * 1.5
++                        Layout.preferredHeight: Layout.preferredWidth
++                    }
++                    Controls.Label {
++                        text: decodeURIComponent(String(attachmentThumb.modelData).split("/").pop())
++                        elide: Text.ElideMiddle
++                        Layout.fillWidth: true
++                        horizontalAlignment: Text.AlignHCenter
++                        font: Kirigami.Theme.smallFont
++                    }
++                }
++
++                Controls.ToolButton {
++                    anchors.top: parent.top
++                    anchors.right: parent.right
++                    icon.name: "edit-delete-remove"
++                    display: Controls.AbstractButton.IconOnly
++                    text: i18nd("kdeconnect-sms", "Remove attachment")
++                    Controls.ToolTip.text: text
++                    Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
++                    Controls.ToolTip.visible: hovered
++                    onClicked: root.removeAttachment(attachmentThumb.index)
++                }
++            }
++        }
++    }
++
+     Controls.Pane {
+         id: sendingArea
+         enabled: page.deviceConnected
+@@ -183,12 +259,6 @@ ColumnLayout {
+                         Layout.preferredWidth: Kirigami.Units.gridUnit * 2
+                         Layout.preferredHeight: Kirigami.Units.gridUnit * 2
+                         padding: 0
+-                        Text {
+-                            id: attachedFilesCount
+-                            text: selectedFileUrls.length
+-                            color: "red"
+-                            visible: selectedFileUrls.length > 0
+-                        }
+                         Kirigami.Icon {
+                             source: "mail-attachment-symbolic"
+                             isMask: true
