@@ -1,0 +1,396 @@
+From 7f870f7c0b8e6f1c6876b6814f948c9b7a81bcd9 Mon Sep 17 00:00:00 2001
+From: Alia Holes <thealiaholes@gmail.com>
+Date: Sat, 7 Nov 2026 21:12:00 -0800
+Subject: [PATCH 3/6] sms: show sent messages right away until the phone
+ confirms them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A message sent from the desktop only appeared once the phone echoed it back,
+and on a new-conversation page it never appeared: the echo was dropped as an
+update for a thread the page did not know yet.
+
+Add the message to the conversation at once, marked "Sending…", and replace
+it with the phone's copy when that arrives. If no copy arrives within two
+minutes the row says "Not confirmed by the phone yet", and if the daemon
+reports messageSendFailed it says "Not sent: <reason>". A page started for a
+new recipient adopts the thread of the first message to or from that
+recipient, from either conversationCreated or conversationUpdated, so later
+messages land on the page too.
+---
+ smsapp/conversationmodel.cpp       | 141 +++++++++++++++++++++++++++--
+ smsapp/conversationmodel.h         |  27 +++++-
+ smsapp/qml/ChatMessage.qml         |   9 +-
+ smsapp/qml/ConversationDisplay.qml |  10 ++
+ 4 files changed, 178 insertions(+), 9 deletions(-)
+
+diff --git a/smsapp/conversationmodel.cpp b/smsapp/conversationmodel.cpp
+index 40877b4..a0e0cf1 100644
+--- a/smsapp/conversationmodel.cpp
++++ b/smsapp/conversationmodel.cpp
+@@ -10,6 +10,7 @@
+ #include <KLocalizedString>
+ 
+ #include <QApplication>
++#include <QDateTime>
+ #include <QMessageBox>
+ 
+ #include "attachmentinfo.h"
+@@ -28,7 +29,12 @@ ConversationModel::ConversationModel(QObject *parent)
+     roles.insert(Roles::SenderRole, "sender");
+     roles.insert(Roles::AvatarRole, "avatar");
+     roles.insert(Roles::AttachmentsRole, "attachments");
++    roles.insert(Roles::SendStateRole, "sendState");
++    roles.insert(Roles::SendStateTextRole, "sendStateText");
+     setItemRoleNames(roles);
++
++    m_pendingTimer.setInterval(15 * 1000);
++    connect(&m_pendingTimer, &QTimer::timeout, this, &ConversationModel::checkPendingMessages);
+ }
+ 
+ ConversationModel::~ConversationModel()
+@@ -48,7 +54,9 @@ void ConversationModel::setThreadId(const qint64 &threadId)
+     m_threadId = threadId;
+     clear();
+     knownMessageIDs.clear();
++    m_pendingItems.clear();
+     this->lastRequestedMessageIndex = std::nullopt;
++    Q_EMIT threadIdChanged();
+     if (m_threadId != INVALID_THREAD_ID && !m_deviceId.isEmpty()) {
+         requestMessages(RequestMessageRole::FetchMore);
+         if (m_thumbnailsProvider) {
+@@ -67,6 +75,7 @@ void ConversationModel::setDeviceId(const QString &deviceId)
+     if (m_conversationsInterface) {
+         disconnect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationUpdated, this, &ConversationModel::handleConversationUpdate);
+         disconnect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationCreated, this, &ConversationModel::handleConversationCreated);
++        disconnect(m_conversationsInterface, &DeviceConversationsDbusInterface::messageSendFailed, this, &ConversationModel::handleMessageSendFailed);
+         delete m_conversationsInterface;
+     }
+ 
+@@ -77,6 +86,7 @@ void ConversationModel::setDeviceId(const QString &deviceId)
+     connect(m_conversationsInterface, &DeviceConversationsDbusInterface::conversationCreated, this, &ConversationModel::handleConversationCreated);
+ 
+     connect(m_conversationsInterface, &DeviceConversationsDbusInterface::attachmentReceived, this, &ConversationModel::filePathReceived);
++    connect(m_conversationsInterface, &DeviceConversationsDbusInterface::messageSendFailed, this, &ConversationModel::handleMessageSendFailed);
+ 
+     m_thumbnailsProvider = ThumbnailsProvider::getInContextForObject(this);
+     if (!m_thumbnailsProvider) {
+@@ -110,6 +120,7 @@ bool ConversationModel::sendReplyToConversation(const QString &textMessage, QLis
+     }
+ 
+     m_conversationsInterface->replyToConversation(m_threadId, textMessage, fileUrls);
++    addPendingMessage(textMessage, fileUrls.size());
+     return true;
+ }
+ 
+@@ -127,6 +138,7 @@ bool ConversationModel::startNewConversation(const QString &textMessage, const Q
+     }
+ 
+     m_conversationsInterface->sendWithoutConversation(addresses, textMessage, fileUrls);
++    addPendingMessage(textMessage, fileUrls.size());
+     return true;
+ }
+ 
+@@ -229,6 +241,11 @@ void ConversationModel::createRowFromMessage(const ConversationMessage &message)
+     }
+ 
+     item->setData(attachmentInfoList, Roles::AttachmentsRole);
++    item->setData(Confirmed, Roles::SendStateRole);
++
++    if (message.isOutgoing()) {
++        resolvePendingMessage(message);
++    }
+ 
+     knownMessageIDs.insert(message.uID());
+ 
+@@ -240,19 +257,133 @@ void ConversationModel::createRowFromMessage(const ConversationMessage &message)
+     }
+ 
+     // It is important to sort the items manually, so we know when a new message has arrived,
+-    // and the UI can react accordingly
+-    if (rowCount() > 0 && this->item(0)->data(Roles::DateRole).toLongLong() < message.date()) {
++    // and the UI can react accordingly. Messages still waiting for the phone stay on top.
++    const int newest = m_pendingItems.size();
++    if (rowCount() > newest && this->item(newest)->data(Roles::DateRole).toLongLong() < message.date()) {
+         Q_EMIT gotNewMessage();
+-        insertRow(0, item);
++        insertRow(newest, item);
++    } else if (rowCount() == newest && newest > 0) {
++        Q_EMIT gotNewMessage();
++        insertRow(newest, item);
+     } else {
+         appendRow(item);
+     }
+ }
+ 
++QString ConversationModel::sendStateText(SendState state, const QString &reason)
++{
++    switch (state) {
++    case Sending:
++        return i18nd("kdeconnect-sms", "Sending…");
++    case Unconfirmed:
++        return i18nd("kdeconnect-sms", "Not confirmed by the phone yet");
++    case Failed:
++        return reason.isEmpty() ? i18nd("kdeconnect-sms", "Not sent") : i18nd("kdeconnect-sms", "Not sent: %1", reason);
++    case Confirmed:
++        break;
++    }
++    return QString();
++}
++
++void ConversationModel::addPendingMessage(const QString &textMessage, int attachmentCount)
++{
++    auto item = new QStandardItem;
++    QString body = textMessage;
++    if (attachmentCount > 0) {
++        const QString attachments = i18ndp("kdeconnect-sms", "(%1 attachment)", "(%1 attachments)", attachmentCount);
++        body = body.isEmpty() ? attachments : body + QLatin1Char('\n') + attachments;
++    }
++    item->setText(body);
++    item->setData(true, Roles::FromMeRole);
++    item->setData(QDateTime::currentMSecsSinceEpoch(), Roles::DateRole);
++    item->setData(QString(), Roles::SenderRole);
++    item->setData(QList<QVariant>(), Roles::AttachmentsRole);
++    item->setData(Sending, Roles::SendStateRole);
++    item->setData(sendStateText(Sending), Roles::SendStateTextRole);
++    // What the phone's copy will carry, to recognise it
++    item->setData(textMessage, Qt::UserRole + 100);
++    item->setData(attachmentCount > 0, Qt::UserRole + 101);
++
++    Q_EMIT gotNewMessage();
++    insertRow(0, item);
++    m_pendingItems.prepend(item);
++    m_pendingTimer.start();
++}
++
++void ConversationModel::resolvePendingMessage(const ConversationMessage &message)
++{
++    // Only messages written after the pending one was queued can be its copy
++    // (with some slack for the phone's clock); older history with the same
++    // text must not remove it.
++    for (int i = 0; i < m_pendingItems.size(); ++i) {
++        QStandardItem *pending = m_pendingItems.at(i);
++        const qint64 queuedAt = pending->data(Roles::DateRole).toLongLong();
++        if (message.date() < queuedAt - 5 * 60 * 1000) {
++            continue;
++        }
++        const QString text = pending->data(Qt::UserRole + 100).toString();
++        const bool hadAttachments = pending->data(Qt::UserRole + 101).toBool();
++        const bool sameText = text.trimmed() == message.body().trimmed();
++        if (sameText && (!hadAttachments || message.containsAttachment() || !text.isEmpty())) {
++            m_pendingItems.removeAt(i);
++            removeRow(pending->row());
++            break;
++        }
++    }
++    if (m_pendingItems.isEmpty()) {
++        m_pendingTimer.stop();
++    }
++}
++
++void ConversationModel::checkPendingMessages()
++{
++    const qint64 now = QDateTime::currentMSecsSinceEpoch();
++    for (QStandardItem *pending : std::as_const(m_pendingItems)) {
++        if (pending->data(Roles::SendStateRole).toInt() == Sending && now - pending->data(Roles::DateRole).toLongLong() > UNCONFIRMED_AFTER_MS) {
++            pending->setData(Unconfirmed, Roles::SendStateRole);
++            pending->setData(sendStateText(Unconfirmed), Roles::SendStateTextRole);
++        }
++    }
++}
++
++void ConversationModel::handleMessageSendFailed(const QString &reason)
++{
++    // The daemon does not say which message failed; it can only be one we
++    // queued recently and that is still waiting. The newest is first.
++    const qint64 now = QDateTime::currentMSecsSinceEpoch();
++    for (int i = 0; i < m_pendingItems.size(); ++i) {
++        QStandardItem *pending = m_pendingItems.at(i);
++        if (now - pending->data(Roles::DateRole).toLongLong() < UNCONFIRMED_AFTER_MS) {
++            pending->setData(Failed, Roles::SendStateRole);
++            pending->setData(sendStateText(Failed, reason), Roles::SendStateTextRole);
++            // A failed row stays where it is, but is no longer waiting for the phone
++            m_pendingItems.removeAt(i);
++            break;
++        }
++    }
++}
++
++bool ConversationModel::adoptThreadOf(const ConversationMessage &message)
++{
++    // A new-conversation page has no thread until the phone creates one;
++    // the first message to or from our recipient is our thread.
++    if (m_threadId != INVALID_THREAD_ID || m_addressList.isEmpty() || message.addresses().isEmpty() || message.isMultitarget()) {
++        return false;
++    }
++    if (!SmsHelper::isPhoneNumberMatch(m_addressList.first().address(), message.addresses().first().address())) {
++        return false;
++    }
++    m_threadId = message.threadID();
++    Q_EMIT threadIdChanged();
++    return true;
++}
++
+ void ConversationModel::handleConversationUpdate(const QDBusVariant &msg)
+ {
+     ConversationMessage message = ConversationMessage::fromDBus(msg);
+ 
++    adoptThreadOf(message);
++
+     if (message.threadID() != m_threadId) {
+         // If a conversation which we are not currently viewing was updated, discard the information
+         qCDebug(KDECONNECT_SMS_CONVERSATION_MODEL) << "Saw update for thread" << message.threadID() << "but we are currently viewing" << m_threadId;
+@@ -265,9 +396,7 @@ void ConversationModel::handleConversationCreated(const QDBusVariant &msg)
+ {
+     ConversationMessage message = ConversationMessage::fromDBus(msg);
+ 
+-    if (m_threadId == INVALID_THREAD_ID && SmsHelper::isPhoneNumberMatch(m_addressList[0].address(), message.addresses().first().address())
+-        && !message.isMultitarget()) {
+-        m_threadId = message.threadID();
++    if (adoptThreadOf(message)) {
+         createRowFromMessage(message);
+     }
+ }
+diff --git a/smsapp/conversationmodel.h b/smsapp/conversationmodel.h
+index 1f89186..a518c2f 100644
+--- a/smsapp/conversationmodel.h
++++ b/smsapp/conversationmodel.h
+@@ -11,6 +11,7 @@
+ #include <QQueue>
+ #include <QSet>
+ #include <QStandardItemModel>
++#include <QTimer>
+ #include <qtmetamacros.h>
+ 
+ #include "dbusinterfaces/dbusinterfaces.h"
+@@ -22,7 +23,7 @@
+ class ConversationModel : public QStandardItemModel
+ {
+     Q_OBJECT
+-    Q_PROPERTY(qint64 threadId READ threadId WRITE setThreadId)
++    Q_PROPERTY(qint64 threadId READ threadId WRITE setThreadId NOTIFY threadIdChanged)
+     Q_PROPERTY(QString deviceId READ deviceId WRITE setDeviceId NOTIFY deviceIdChanged)
+     Q_PROPERTY(QList<ConversationAddress> addressList READ addressList WRITE setAddressList)
+ 
+@@ -36,10 +37,23 @@ public:
+         DateRole,
+         AvatarRole, // URI to the avatar of the sender of the message. Undefined if outgoing.
+         AttachmentsRole, // The list of attachments. Undefined if there is no attachment in a message
++        SendStateRole, // A SendState: whether this row is a message we sent that the phone has not confirmed yet
++        SendStateTextRole, // Human-readable text for SendStateRole, empty for confirmed messages
+     };
+ 
+     Q_ENUM(Roles)
+ 
++    enum SendState {
++        Confirmed = 0, // A message the phone told us about
++        Sending, // Sent from here, waiting for the phone's copy
++        Unconfirmed, // Sent from here, the phone has not confirmed it for a long time
++        Failed, // Could not be handed to the phone
++    };
++    Q_ENUM(SendState)
++
++    /** A pending row turns Unconfirmed after this long without the phone's copy */
++    static constexpr qint64 UNCONFIRMED_AFTER_MS = 2 * 60 * 1000;
++
+     qint64 threadId() const;
+     void setThreadId(const qint64 &threadId);
+ 
+@@ -78,13 +92,20 @@ Q_SIGNALS:
+     void gotNewMessage();
+     void filePathReceived(QString filePath, QString fileName);
+     void deviceIdChanged(const QString &value);
++    void threadIdChanged();
+ 
+ private Q_SLOTS:
+     void handleConversationUpdate(const QDBusVariant &message);
+     void handleConversationCreated(const QDBusVariant &message);
++    void handleMessageSendFailed(const QString &reason);
+ 
+ private:
+     void createRowFromMessage(const ConversationMessage &message);
++    void addPendingMessage(const QString &textMessage, int attachmentCount);
++    void resolvePendingMessage(const ConversationMessage &message);
++    void checkPendingMessages();
++    bool adoptThreadOf(const ConversationMessage &message);
++    static QString sendStateText(SendState state, const QString &reason = QString());
+ 
+     DeviceConversationsDbusInterface *m_conversationsInterface;
+     std::optional<ThumbnailsProvider *> m_thumbnailsProvider;
+@@ -94,6 +115,10 @@ private:
+     QSet<qint32> knownMessageIDs; // Set of known Message uIDs
+ 
+     std::optional<qint64> lastRequestedMessageIndex = std::nullopt;
++
++    // Rows for messages sent from here that the phone has not echoed back yet; always at the top (newest)
++    QList<QStandardItem *> m_pendingItems;
++    QTimer m_pendingTimer;
+ };
+ 
+ #endif // CONVERSATIONMODEL_H
+diff --git a/smsapp/qml/ChatMessage.qml b/smsapp/qml/ChatMessage.qml
+index dd520fd..431909c 100644
+--- a/smsapp/qml/ChatMessage.qml
++++ b/smsapp/qml/ChatMessage.qml
+@@ -22,6 +22,9 @@ Item {
+     property string name
+     property bool multiTarget
+     property var attachmentList: []
++    // ConversationModel.SendState: 0 confirmed by the phone, 1 sending, 2 unconfirmed, 3 failed
++    property int sendState: 0
++    property string sendStateText
+ 
+     signal messageCopyRequested(string message)
+ 
+@@ -69,6 +72,7 @@ Item {
+             Layout.minimumWidth: dateLabel.implicitWidth
+ 
+             color: Qt.tint(Kirigami.Theme.backgroundColor, Qt.alpha(Kirigami.Theme.highlightColor, root.sentByMe ? 0.1 : 0.4))
++            opacity: root.sendState === 1 ? 0.7 : 1
+             radius: Kirigami.Units.cornerRadius
+ 
+             Kirigami.Theme.colorSet: Kirigami.Theme.View
+@@ -123,11 +127,12 @@ Item {
+                 Label {
+                     id: dateLabel
+                     width: parent.width
+-                    text: Qt.formatDateTime(root.dateTime)
++                    text: root.sendStateText.length > 0 ? root.sendStateText : Qt.formatDateTime(root.dateTime)
++                    wrapMode: Text.Wrap
+                     leftPadding: Kirigami.Units.largeSpacing
+                     rightPadding: Kirigami.Units.largeSpacing
+                     bottomPadding: Kirigami.Units.smallSpacing
+-                    color: Kirigami.Theme.disabledTextColor
++                    color: root.sendState >= 2 ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.disabledTextColor
+                     horizontalAlignment: messageLabel.horizontalAlignment
+                 }
+             }
+diff --git a/smsapp/qml/ConversationDisplay.qml b/smsapp/qml/ConversationDisplay.qml
+index 1033899..9cf72d2 100644
+--- a/smsapp/qml/ConversationDisplay.qml
++++ b/smsapp/qml/ConversationDisplay.qml
+@@ -52,6 +52,14 @@ Kirigami.ScrollablePage
+             deviceId: AppData.deviceId
+             threadId: page.conversationId
+             addressList: page.addresses
++
++            // A new-conversation page learns its thread from the phone's copy of the first message
++            onThreadIdChanged: {
++                if (threadId >= 0 && page.conversationId == page.invalidId) {
++                    page.conversationId = String(threadId)
++                }
++            }
++
+             onGotNewMessage: {
+                 // The distance in viewports heights to the end of the block of messages
+                 // e.g if normalizedDistance is 0.5, it means that the we have to scroll
+@@ -100,6 +108,8 @@ Kirigami.ScrollablePage
+             dateTime: new Date(model.date)
+             multiTarget: isMultitarget
+             attachmentList: model.attachments
++            sendState: model.sendState ?? 0
++            sendStateText: model.sendStateText ?? ""
+ 
+             width: viewport.width
+ 
