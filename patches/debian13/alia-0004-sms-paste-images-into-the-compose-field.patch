@@ -1,0 +1,423 @@
+Forwarded: not-yet
+Last-Update: 2026-11-07
+From 7240fc6057c36e4fd796041c47a1e25f49310465 Mon Sep 17 00:00:00 2001
+From: Alia Holes <thealiaholes@gmail.com>
+Date: Sat, 7 Nov 2026 21:08:20 -0800
+Subject: [PATCH 4/6] sms: paste images into the compose field
+
+Paste in the message field, from Ctrl+V or from the right-click menu, now
+attaches an image from the clipboard: a bitmap such as a screenshot or
+"Copy Image" is written to a PNG on a worker thread, under the per-user
+runtime directory, and attached when it is ready; image files copied in a
+file manager are attached directly. When the clipboard holds text,
+including text that comes with a rendered image, it pastes as text.
+Both paths go through the field's paste(), which the desktop style's
+context menu calls, and canPaste now also counts an image. If the image
+cannot be read or saved, an error message above the field says why; a paste
+never silently does nothing.
+
+Attachments picked in the file dialog are now added to the ones already
+selected instead of replacing them.
+---
+ smsapp/CMakeLists.txt      |   3 +
+ smsapp/qml/SendingArea.qml |  79 +++++++++++++++++-
+ smsapp/smshelper.cpp       | 167 +++++++++++++++++++++++++++++++++++++
+ smsapp/smshelper.h         |  38 +++++++++
+ 4 files changed, 286 insertions(+), 1 deletion(-)
+
+diff --git a/smsapp/CMakeLists.txt b/smsapp/CMakeLists.txt
+index ed38535..81dfcf6 100644
+--- a/smsapp/CMakeLists.txt
++++ b/smsapp/CMakeLists.txt
+@@ -1,3 +1,5 @@
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Concurrent)
++
+ add_library(kdeconnectsmshelper STATIC
+     smshelper.cpp
+     gsmasciimap.cpp
+@@ -26,6 +28,7 @@ target_link_libraries(kdeconnectsmshelper
+     PUBLIC
+     Qt::Core
+     Qt::Gui
++    Qt::Concurrent
+     Qt::DBus
+     KF6::People
+     Qt::Qml
+diff --git a/smsapp/qml/SendingArea.qml b/smsapp/qml/SendingArea.qml
+index 104cafa..6ebb52a 100644
+--- a/smsapp/qml/SendingArea.qml
++++ b/smsapp/qml/SendingArea.qml
+@@ -35,11 +35,58 @@ ColumnLayout {
+         fileMode: FileDialog.OpenFiles
+ 
+         onAccepted: {
+-            root.selectedFileUrls = fileDialog.fileUrls
++            root.addAttachments(fileDialog.fileUrls)
+             fileDialog.close()
+         }
+     }
+ 
++    function addAttachments(urls) {
++        root.selectedFileUrls = Array.from(root.selectedFileUrls).concat(Array.from(urls))
++    }
++
++    // Pastes whose image is still being written (off the GUI thread)
++    property var pendingPastes: []
++
++    Connections {
++        target: SmsHelper
++        function onClipboardAttachmentsReady(requestId, urls) {
++            const index = root.pendingPastes.indexOf(requestId)
++            if (index < 0) {
++                return
++            }
++            root.pendingPastes.splice(index, 1)
++            if (urls.length > 0) {
++                pasteError.visible = false
++                root.addAttachments(urls)
++            }
++        }
++        function onClipboardPasteFailed(requestId, message) {
++            const index = root.pendingPastes.indexOf(requestId)
++            if (index < 0) {
++                return
++            }
++            root.pendingPastes.splice(index, 1)
++            root.showPasteError(message)
++        }
++    }
++
++    // A paste that cannot become an attachment says so, never a silent nothing
++    function showPasteError(message) {
++        pasteError.text = message
++        pasteError.visible = true
++    }
++
++    Kirigami.InlineMessage {
++        id: pasteError
++        objectName: "pasteError"
++        Layout.fillWidth: true
++        Layout.leftMargin: Kirigami.Units.largeSpacing
++        Layout.rightMargin: Kirigami.Units.largeSpacing
++        type: Kirigami.MessageType.Error
++        showCloseButton: true
++        visible: false
++    }
++
+     Controls.Pane {
+         id: sendingArea
+         enabled: page.deviceConnected
+@@ -67,6 +114,36 @@ ColumnLayout {
+                     selectByMouse: true
+                     hoverEnabled: true
+ 
++                    // Every paste goes through paste(): Ctrl+V below, and Paste in the
++                    // right-click menu, which calls target.paste() and checks canPaste.
++                    // An image (or image files) on the clipboard is attached; text pastes
++                    // as text. These replace TextEdit's own canPaste/paste(), which only
++                    // know about text.
++                    readonly property bool canPaste: !readOnly && SmsHelper.clipboardPasteable
++
++                    function paste() {
++                        const requestId = SmsHelper.pasteClipboardAttachments()
++                        if (requestId > 0) {
++                            root.pendingPastes.push(requestId)
++                            return
++                        }
++                        const pasted = SmsHelper.clipboardText()
++                        if (pasted.length === 0) {
++                            return
++                        }
++                        if (selectionStart !== selectionEnd) {
++                            remove(selectionStart, selectionEnd)
++                        }
++                        insert(cursorPosition, pasted)
++                    }
++
++                    Keys.onPressed: event => {
++                        if (event.matches(StandardKey.Paste)) {
++                            messageField.paste()
++                            event.accepted = true
++                        }
++                    }
++
+                     Keys.onReturnPressed: event => {
+                         if (event.key === Qt.Key_Return) {
+                             if (event.modifiers & Qt.ShiftModifier) {
+diff --git a/smsapp/smshelper.cpp b/smsapp/smshelper.cpp
+index 6f6735c..64d587e 100644
+--- a/smsapp/smshelper.cpp
++++ b/smsapp/smshelper.cpp
+@@ -7,20 +7,30 @@
+ #include "smshelper.h"
+ 
+ #include <QClipboard>
++#include <QCoreApplication>
++#include <QFutureWatcher>
++#include <QDateTime>
++#include <QDir>
++#include <QFile>
+ #include <QFileInfo>
+ #include <QGuiApplication>
+ #include <QHash>
+ #include <QIcon>
++#include <QImage>
+ #include <QImageReader>
++#include <QMimeData>
+ #include <QMimeDatabase>
+ #include <QMimeType>
+ #include <QPainter>
+ #include <QRegularExpression>
+ #include <QStandardPaths>
+ #include <QString>
++#include <QTemporaryFile>
++#include <QtConcurrentRun>
+ #include <QtDebug>
+ 
+ #include <algorithm>
++#include <utility>
+ 
+ #include <KPeople/PersonData>
+ #include <KPeople/PersonsModel>
+@@ -504,6 +514,163 @@ bool SmsHelper::isShrinkableImage(const QUrl &url)
+     return reader.canRead();
+ }
+ 
++SmsHelper::SmsHelper(QObject *parent)
++    : QObject(parent)
++{
++    if (qobject_cast<QGuiApplication *>(QCoreApplication::instance())) {
++        connect(QGuiApplication::clipboard(), &QClipboard::dataChanged, this, &SmsHelper::clipboardChanged);
++    }
++}
++
++namespace
++{
++// Files copied in a file manager, if every one of them is a local image we can send
++QList<QUrl> clipboardImageFiles(const QMimeData *mimeData)
++{
++    if (!mimeData->hasUrls()) {
++        return {};
++    }
++    const QList<QUrl> urls = mimeData->urls();
++    if (urls.isEmpty()) {
++        return {};
++    }
++    for (const QUrl &url : urls) {
++        if (!url.isLocalFile() || !QFileInfo(url.toLocalFile()).isFile() || !SmsHelper::isShrinkableImage(url)) {
++            return {};
++        }
++    }
++    return urls;
++}
++
++// A bitmap (screenshot, "Copy Image"). If text comes with it, the user most
++// likely copied text from a document that also offers a rendering: paste text.
++bool clipboardHasBitmapOnly(const QMimeData *mimeData)
++{
++    return mimeData->hasImage() && !mimeData->hasText();
++}
++}
++
++bool SmsHelper::clipboardPasteable() const
++{
++    if (!qobject_cast<QGuiApplication *>(QCoreApplication::instance())) {
++        return false;
++    }
++    const QMimeData *mimeData = QGuiApplication::clipboard()->mimeData();
++    if (!mimeData) {
++        return false;
++    }
++    return (mimeData->hasText() && !mimeData->text().isEmpty()) || clipboardHasBitmapOnly(mimeData) || !clipboardImageFiles(mimeData).isEmpty();
++}
++
++QString SmsHelper::clipboardText() const
++{
++    const QMimeData *mimeData = QGuiApplication::clipboard()->mimeData();
++    return mimeData && mimeData->hasText() ? mimeData->text() : QString();
++}
++
++QString SmsHelper::pasteDirectory()
++{
++    // The per-user runtime directory (0700, owned by us), never a shared /tmp
++    return QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kdeconnect-sms-paste");
++}
++
++QUrl SmsHelper::savePastedImage(const QImage &image, const QString &dirPath, QString *error)
++{
++    QDir dir(dirPath);
++    if (!dir.mkpath(QStringLiteral("."))) {
++        qWarning() << "Could not create" << dirPath;
++        if (error) {
++            *error = QStringLiteral("cannot create %1").arg(dirPath);
++        }
++        return {};
++    }
++    QFile::setPermissions(dirPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
++
++    // Pasted images are only needed until the daemon has read them
++    const QDateTime dayAgo = QDateTime::currentDateTime().addDays(-1);
++    const QFileInfoList oldFiles = dir.entryInfoList({QStringLiteral("paste-*.png")}, QDir::Files);
++    for (const QFileInfo &old : oldFiles) {
++        if (old.lastModified() < dayAgo) {
++            QFile::remove(old.absoluteFilePath());
++        }
++    }
++
++    QTemporaryFile file(dir.absoluteFilePath(QStringLiteral("paste-XXXXXX.png")));
++    file.setAutoRemove(false);
++    // Quality 100 = least compression: fast, the daemon re-encodes it anyway
++    if (!file.open() || !image.save(&file, "PNG", 100)) {
++        qWarning() << "Could not save pasted image" << file.fileName() << file.errorString();
++        if (error) {
++            *error = QStringLiteral("cannot write %1: %2").arg(file.fileName().isEmpty() ? dirPath : file.fileName(), file.errorString());
++        }
++        file.remove();
++        return {};
++    }
++    return QUrl::fromLocalFile(file.fileName());
++}
++
++int SmsHelper::pasteClipboardAttachments()
++{
++    const QMimeData *mimeData = QGuiApplication::clipboard()->mimeData();
++    if (!mimeData) {
++        return 0;
++    }
++
++    const int requestId = ++m_lastPasteRequest;
++
++    const QList<QUrl> files = clipboardImageFiles(mimeData);
++    if (!files.isEmpty()) {
++        // Deliver like the bitmap case, after the caller has stored the id
++        QMetaObject::invokeMethod(
++            this,
++            [this, requestId, files]() {
++                Q_EMIT clipboardAttachmentsReady(requestId, files);
++            },
++            Qt::QueuedConnection);
++        return requestId;
++    }
++
++    if (!clipboardHasBitmapOnly(mimeData)) {
++        --m_lastPasteRequest;
++        return 0;
++    }
++    // Reading the clipboard has to happen here; encoding and writing the PNG,
++    // which takes long for a big screenshot, happens off the GUI thread.
++    const QImage image = qvariant_cast<QImage>(mimeData->imageData());
++    if (image.isNull()) {
++        // The clipboard says it holds only an image but it cannot be read: say so,
++        // a paste that does nothing at all looks like a broken app
++        const QString message = i18nd("kdeconnect-sms", "Could not paste the image: the clipboard image could not be read.");
++        QMetaObject::invokeMethod(
++            this,
++            [this, requestId, message]() {
++                Q_EMIT clipboardPasteFailed(requestId, message);
++            },
++            Qt::QueuedConnection);
++        return requestId;
++    }
++    using Saved = std::pair<QUrl, QString>;
++    auto *watcher = new QFutureWatcher<Saved>(this);
++    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, requestId]() {
++        const Saved saved = watcher->result();
++        watcher->deleteLater();
++        if (saved.first.isEmpty()) {
++            Q_EMIT clipboardPasteFailed(requestId, i18nd("kdeconnect-sms", "Could not paste the image: %1", saved.second));
++            return;
++        }
++        Q_EMIT clipboardAttachmentsReady(requestId, QList<QUrl>{saved.first});
++    });
++    watcher->setFuture(QtConcurrent::run(
++        [](const QImage &image, const QString &dirPath) {
++            QString error;
++            const QUrl url = savePastedImage(image, dirPath, &error);
++            return Saved(url, error);
++        },
++        image,
++        pasteDirectory()));
++    return requestId;
++}
++
+ QIcon SmsHelper::getThumbnailForAttachment(const Attachment &attachment)
+ {
+     static const QMimeDatabase mimeDatabase;
+diff --git a/smsapp/smshelper.h b/smsapp/smshelper.h
+index 248ed7b..2ce46cc 100644
+--- a/smsapp/smshelper.h
++++ b/smsapp/smshelper.h
+@@ -8,9 +8,11 @@
+ #define SMSHELPER_H
+ 
+ #include <QIcon>
++#include <QImage>
+ #include <QJSEngine>
+ #include <QQmlEngine>
+ #include <QSharedPointer>
++#include <QUrl>
+ 
+ #include <KPeople/PersonData>
+ 
+@@ -23,7 +25,11 @@ class PersonsCache;
+ class SmsHelper : public QObject
+ {
+     Q_OBJECT
++    /** Whether a paste would do anything: text, a bitmap, or local image files on the clipboard */
++    Q_PROPERTY(bool clipboardPasteable READ clipboardPasteable NOTIFY clipboardChanged)
+ public:
++    explicit SmsHelper(QObject *parent = nullptr);
++
+     static QObject *singletonProvider(QQmlEngine *engine, QJSEngine *scriptEngine);
+ 
+     /**
+@@ -134,6 +140,29 @@ public:
+      */
+     Q_INVOKABLE static bool isShrinkableImage(const QUrl &url);
+ 
++    bool clipboardPasteable() const;
++
++    /** The clipboard's text, for a text paste */
++    Q_INVOKABLE QString clipboardText() const;
++
++    /**
++     * If the clipboard holds an image (or local image files), start turning it into local file
++     * URLs to attach and return a request id (> 0); clipboardAttachmentsReady() delivers them.
++     * A bitmap is written to a PNG under pasteDirectory() on a worker thread.
++     * If that fails, clipboardPasteFailed() says why instead (never a silent nothing).
++     * Returns 0 when the clipboard holds text or anything else, so the caller can paste text.
++     */
++    Q_INVOKABLE int pasteClipboardAttachments();
++
++    /** Where pasted bitmaps are written: under the per-user runtime directory */
++    static QString pasteDirectory();
++
++    /**
++     * Write a pasted bitmap as PNG into dirPath (and drop pastes older than a day); thread-safe.
++     * Returns an empty URL on failure and, if error is given, what went wrong.
++     */
++    static QUrl savePastedImage(const QImage &image, const QString &dirPath, QString *error = nullptr);
++
+     /**
+      * Together, the images of one message are re-encoded by the daemon to about this many bytes
+      * (keep in sync with MmsAttachments::DEFAULT_IMAGE_BUDGET in the SMS plugin)
+@@ -145,7 +174,16 @@ public:
+      */
+     Q_INVOKABLE static QIcon getThumbnailForAttachment(const Attachment &attachment);
+ 
++Q_SIGNALS:
++    void clipboardChanged();
++    /** The result of pasteClipboardAttachments() */
++    void clipboardAttachmentsReady(int requestId, const QList<QUrl> &urls);
++    /** pasteClipboardAttachments() could not produce the image; message is for the user */
++    void clipboardPasteFailed(int requestId, const QString &message);
++
+ private:
++    int m_lastPasteRequest = 0;
++
+     static bool isInGsmAlphabet(const QChar &ch);
+     static bool isInGsmAlphabetExtension(const QChar &ch);
+ };
+-- 
+2.43.0
+
